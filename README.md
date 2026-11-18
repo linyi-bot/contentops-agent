@@ -3,7 +3,7 @@
 [![CI](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1f6feb)
-![Tests](https://img.shields.io/badge/tests-12%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-20%20passed-brightgreen)
 
 > 内容运营多智能体工作台 · LangGraph 编排 · 可评测、可观测、可复现
 
@@ -23,11 +23,11 @@ AI Agent 岗位的 JD 里反复出现这 7 个词，本项目一个不落地覆�
 |---|---|---|
 | 编排（Orchestration） | LangGraph `StateGraph`，六节点 + 两条条件边（核查回写、人工打回） | ✅ 已完成 |
 | 工具调用（Tool Use） | 检索工具已按 schema 接入；抓取 / 发布工具 | 检索 ✅，其余阶段 3 |
-| RAG 检索增强 | 本地知识库 → 按二级标题分块 → BM25 式打分 → 拼上下文 | ✅ 已完成 |
-| 评测（Eval） | 30 条黄金集，4 个指标出报告 | 阶段 3 |
-| 可观测（Observability） | 自建 trace：每节点耗时 + 一句人话 | trace ✅，报告页阶段 3 |
+| RAG 检索增强 | 本地知识库 → 按二级标题分块 → BM25 式打分（单字 + 二元组）→ 拼上下文 | ✅ 已完成 |
+| 评测（Eval） | 30 条黄金集，5 个指标出报告，失败样本逐条留原因 | ✅ 已完成（mock 基线） |
+| 可观测（Observability） | 自建 trace：每节点耗时 + 一句人话 | ✅ 已完成 |
 | 人工中断（Human-in-the-loop） | `interrupt()` 真暂停 + checkpointer 可恢复 | ✅ 已完成 |
-| 部署（Deploy） | Docker 单机 + 公网隧道 | 阶段 3 |
+| 部署（Deploy） | Docker 单机 + 公网隧道 | 阶段 3 待做 |
 
 ---
 
@@ -94,6 +94,9 @@ python -m contentops.cli run --topic "用 AI 做周报自动化" --auto approve 
 
 :: 5) 测试
 python -m pytest -q
+
+:: 6) 评测：30 条黄金集 → 汇总表 + 失败明细（报告写进 reports\）
+python -m contentops.cli eval --dataset evals\golden --out reports
 ```
 
 `scripts\dev.cmd` 只是把第 2 步和启动命令包了一下（Windows 专用，省得每次设环境变量）。
@@ -117,47 +120,66 @@ contentops-agent/
 ├── .env.example
 ├── .gitignore
 ├── .github/workflows/ci.yml   # push 即跑 pytest
+├── evals/golden/              # 30 条黄金集（10 常规 / 10 边界 / 10 应拒答）
+├── reports/                   # 评测报告（每改一次闸门/提示词就留一份，A→B 的出处）
 ├── docs/
 │   ├── kb/                    # 知识库（检索的语料，纯 markdown）
-│   ├── 评测口径.md             # 指标定义，阶段 3 填数
+│   ├── 看板.md                 # 阶段 1–5 的任务看板（现在做哪张卡，只在这张表上）
+│   ├── 评测口径.md             # 指标定义 + 三版实测数字 + 这组数不能说什么
+│   ├── 讲述材料.md             # 3 分钟讲稿 + 录屏分镜 + 十个必问题
 │   └── 简历回填模板.md
 ├── scripts/
 │   └── dev.cmd                # 设好 PYTHONPATH 再跑，避免环境污染
 ├── src/contentops/
 │   ├── state.py               # 图的状态定义（含断言 Claim 与审核包 ReviewPacket）
 │   ├── llm.py                 # 模型层：mock / deepseek 统一接口
-│   ├── retriever.py           # 知识库分块与检索
+│   ├── retriever.py           # 知识库分块、单字 + 二元组切分、BM25 式打分
 │   ├── nodes.py               # 五个节点：检索 / 起草 / 核查 / 审核 / 发布
 │   ├── graph.py               # 图的组装 + 两条条件边 + 会话（checkpointer）工具
-│   └── cli.py                 # 命令行入口（含人工审核交互）
+│   ├── eval.py                # 评测器：跑黄金集、算指标、留失败明细
+│   └── cli.py                 # 命令行入口（run / kb / eval，含人工审核交互）
 └── tests/
     ├── test_smoke.py          # 链路能不能跑通
-    └── test_stage2.py         # 核查规则 / 中断 / 打回额度
+    ├── test_stage2.py         # 核查规则 / 中断 / 打回额度
+    └── test_stage3.py         # 评测器自身：数据集校验、闸门开关、失败明细
 ```
 
 ---
 
-## 五、评测口径（阶段 3 交付）
+## 五、评测（阶段 3 交付）
 
-| 指标 | 定义 | 目标 |
-|---|---|---|
-| 引用命中率 | 草稿里每条引用都能在知识库中找到出处 | ≥ 90% |
-| 事实一致性 | 黄金集 30 条里核查节点判「通过」且人工判对的占比 | ≥ 85% |
-| 平均 token 成本 | 单次运行 input+output token | 记录基线，逐版下降 |
-| P95 延迟 | 端到端耗时 95 分位 | < 20s（mock 本地） |
+30 条黄金集，三个版本的代码各跑一遍（完整口径见 [`docs/评测口径.md`](docs/评测口径.md)）：
 
-> 现在这张表是空的，填数之前**不许写进简历**。等阶段 3 跑出报告，再用真实数字回填。
+| 版本 | 引用命中率 | 事实一致性（代理） | 拒答准确率 | 端到端通过 | 平均 / P95 |
+|---|---|---|---|---|---|
+| v0.2 基线 | 100% | 7.5% | 10% | 4 / 30 | 32 / 41 ms |
+| v0.3 修检索与 mock，不开闸门 | 100% | 55.0% | 0% | 20 / 30 | 32 / 38 ms |
+| v0.3 加相关度闸门（0.09） | 100% | 91.7% | 100% | 30 / 30 | 33 / 40 ms |
+
+三件事值得说，因为都能被追问：
+
+1. **7.5% 那个数是 bug**：mock 解析上下文时按空行分块，第一块开头是「资料：」，
+   于是第 1 条资料被整条丢掉、永远只引第 2、3 条 —— 表上表现为「引用命中率 100%、事实一致性 7.5%」。
+   修完是 55.0%。
+2. **拒答靠闸门**：检索最高分低于 0.09 就不写稿，不拿不相关段落硬凑。拒答 10% → 100%。
+3. **这组数不是模型质量**：mock 只会照抄资料，语义对不对机器没判。它测的是流水线的行为
+   （拦得住、拒得掉、不空转），换成真模型要重跑；也是因为这个，简历里没写「准确率 90%+」。
+
+> 现在这张表是**跑出来的**，不是估的。每改一次闸门或提示词，`reports/` 里都要多一份，
+> 对照着看 A→B —— 只报最新一次的数，等于没有基线。
 
 ---
 
 ## 六、路线图
 
+任务卡（现在做哪一张、卡在哪）看 [`docs/看板.md`](docs/看板.md)；这里只留总览。
+
 | 阶段 | 天数 | 产出 | 验收线 |
 |---|---|---|---|
 | 0 地基 | 1 | git / 依赖 / 仓库 / README / CI | ✅ 已推到 GitHub，Actions 跑 pytest |
-| 1 最小闭环 | 5 | 三节点 + 检索 + mock 模型 | 命令行跑通、有 commit ✅ |
-| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 输入选题产出带引用稿子，12 条测试全绿 |
-| 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | pytest 绿、评测出报告 |
+| 1 最小闭环 | 5 | 三节点 + 检索 + mock 模型 | ✅ 命令行跑通、有 commit |
+| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，12 条测试全绿 |
+| 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | 🟡 评测已出数（30/30）；checkpointer / Docker / 打包未做 |
 | 4 讲述 | 3 | 录屏 + 讲稿 + 10 问 | 脱稿 3 分钟讲完 |
 | 5 投递 | 持续 | 简历回填 + 投递表 | 每周 ≥10 家 |
 
