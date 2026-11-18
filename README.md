@@ -248,5 +248,7 @@ powershell -ExecutionPolicy Bypass -File scripts\docker-smoke.ps1
 |---|---|---|
 | `pip install` 报 `PermissionError: ...whl` | Python 3.14 会把 `os.mkdir(mode=0o700)` 应用到目录 DACL，而 `tempfile.mkdtemp()` 默认就用 0o700；受限令牌因此进不去自己刚建的目录 | 用一个包装脚本把 0o700 改成 0o777 再调 pip（见提交历史里的 `pipx.py`） |
 | `git push` 报 `error adding trust anchors from file: ...ca-bundle.crt` | MinGit 的 OpenSSL 打不开带中文的 CA 路径（工作区目录名里有中文） | 把 `ca-bundle.crt` 复制到纯 ASCII 目录（如 `%TEMP%`），`git -c http.sslCAInfo=<该路径> push` |
+| `git push` 报 `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` | 受限令牌下 schannel 拿不到凭据链 | `git -c http.sslBackend=openssl`（仓库里 `tools/gitconfig` 已默认这么配） |
+| `.ps1` 里的中文全变乱码、报「字符串缺少终止符」 | PowerShell 5.1 读**无 BOM** 的 UTF-8 脚本时按 GBK 解 | 脚本一律存成 UTF-8 **with BOM**；`scripts/check_container_files.py` 里有一条断言守着这个 |
 | `curl` / PowerShell 的 HTTPS 全挂 | schannel 凭证链损坏 | 出网一律走 Python `requests`；git 配 `http.sslBackend=openssl` |
 

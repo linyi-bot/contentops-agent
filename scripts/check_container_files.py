@@ -150,6 +150,14 @@ def main() -> int:
 
         check("build" in svc, f"{name}: 没有 build 段，compose up --build 不会构建镜像")
 
+    # 7) Windows 脚本的编码：PS 5.1 读无 BOM 的 .ps1 会按 GBK 解，
+    #    中文注释和 here-string 直接语法报错 —— 这个坑踩过一次，加一道闸。
+    for ps1 in sorted((ROOT / "scripts").glob("*.ps1")):
+        check(
+            ps1.read_bytes().startswith(b"\xef\xbb\xbf"),
+            f"{ps1.name} 少了 UTF-8 BOM：PowerShell 5.1 会按 GBK 读，中文会变乱码/语法错误",
+        )
+
     return report()
 
 
