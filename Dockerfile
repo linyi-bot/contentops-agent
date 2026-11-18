@@ -32,5 +32,8 @@ USER app
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -m contentops.cli kb --query 周报 >/dev/null || exit 1
 
+# 页面（`docker compose run --service-ports web` 或 compose 里的 web profile）
+EXPOSE 8000
+
 ENTRYPOINT ["python", "-m", "contentops.cli"]
 CMD ["run", "--topic", "用 AI 做周报自动化", "--auto", "approve", "--out", "/app/outputs"]

@@ -3,7 +3,7 @@
 [![CI](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1f6feb)
-![Tests](https://img.shields.io/badge/tests-37%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-44%20passed-brightgreen)
 
 > 内容运营多智能体工作台 · LangGraph 编排 · 可评测、可观测、可复现
 
@@ -24,10 +24,10 @@ AI Agent 岗位的 JD 里反复出现这 7 个词，本项目一个不落地覆�
 | 编排（Orchestration） | LangGraph `StateGraph`，六节点 + 两条条件边（核查回写、人工打回） | ✅ 已完成 |
 | 工具调用（Tool Use） | 检索工具已按 schema 接入；抓取 / 发布工具 | 检索 ✅，其余阶段 3 |
 | RAG 检索增强 | 本地知识库 → 按二级标题分块 → BM25 式打分（单字 + 二元组）→ 拼上下文 | ✅ 已完成 |
-| 评测（Eval） | 30 条黄金集，5 个指标出报告，失败样本逐条留原因 | ✅ 已完成（mock 基线；真模型待 key 重跑） |
-| 可观测（Observability） | 自建 trace：每节点耗时 + 一句人话 + 该版烧了多少 token | ✅ 已完成 |
-| 人工中断（Human-in-the-loop） | `interrupt()` 真暂停 + SQLite checkpointer：进程退出后换一个进程 `resume` 也能接着发布 | ✅ 已完成 |
-| 部署（Deploy） | Docker 单机 + compose + 健康检查 | 🟡 镜像文件就绪，本机 WSL2 未启用（一键脚本见第六节） |
+| 评测（Eval） | 30 条黄金集，5 个指标出报告，失败样本逐条留原因 | ✅ 已完成（mock 基线 + deepseek-flash 真模型各一份） |
+| 可观测（Observability） | 自建 trace 落 sqlite（`runs` + `events` 两张表），页面按时间线画出来；不接 LangSmith | ✅ 已完成 |
+| 人工中断（Human-in-the-loop） | `interrupt()` 真暂停 + SQLite checkpointer：进程退出后换一个进程 `resume` 也能接着发布；页面里也能放行/打回 | ✅ 已完成 |
+| 部署（Deploy） | Docker 单机 + compose + 健康检查；页面服务可选 profile | 🟡 镜像文件就绪，本机 WSL2 未启用（一键脚本见第六节） |
 
 ---
 
@@ -101,14 +101,60 @@ python -m pytest -q
 
 :: 7) 评测：30 条黄金集 → 汇总表 + 失败明细（报告写进 reports\）
 python -m contentops.cli eval --dataset evals\golden --out reports
+
+:: 8) 页面：trace 时间线 + 在浏览器里放行 / 打回
+python -m contentops.cli serve --port 8000
 ```
 
 `scripts\dev.cmd` 只是把第 2 步和启动命令包了一下（Windows 专用，省得每次设环境变量）。
+
+### 双击就能跑（演示 / 录屏用）
+
+不想记命令的话，直接双击根目录的 [双击运行.cmd](双击运行.cmd)：它跑完整条流水线（带 `--auto approve`，跳过人工审核），
+跑完停在窗口最后一行 `Press any key to continue`（中文系统就是「请按任意键继续」），不会一闪就关。
+发布稿写到 `outputs\`。想换选题就给个参数：
+
+```bat
+双击运行.cmd "AI 内容审核的边界在哪"
+```
+
+为什么拆成两层：**`.cmd` 里只放 ASCII**。cmd.exe 按系统代码页逐行读批处理文件，UTF-8 的中文即使 `chcp 65001`
+之后仍可能被按 GBK 切开（实测报 `'化"' 不是内部命令`），所以标题、选题、提示语全交给
+[scripts/demo_run.py](scripts/demo_run.py) 打印。要真实模型照样先填 `.env` 的 `DEEPSEEK_API_KEY`；
+没填就自动回落 mock，链路一样跑通，只是数字没有意义。
 
 **人工审核长什么样**：图停在 `review` 节点，把审核包（选题、第几版、草稿、每条断言的核查结论）打印出来，
 然后等一个答复。答复是 `Command(resume=...)` 喂回图的，不是命令行参数。
 默认用内存 checkpointer（clone 下来零配置能跑）；加上 `--db` 就换成 SQLite checkpointer ——
 状态落盘，**进程退出了也能换一个进程接着发**，`resume --decision reject` 打回后会在新进程里重写一版、再次停在审核。
+
+### 页面：trace 时间线 + 浏览器里放行（阶段 5）
+
+```bat
+python -m contentops.cli serve --port 8000
+:: 打开 http://127.0.0.1:8000
+```
+
+三块东西，够用就行：
+
+| 页面 | 看什么 |
+|---|---|
+| 首页 | 一个选题输入框 + 全部运行（状态 / 版本 / 事件数 / 模型 / 成本） |
+| 详情 | trace 时间线（节点、耗时、一句说明、落库时间）、草稿、每条断言的核查结论、发布记录 |
+| 审核 | 停在 `paused` 的运行会出「放行并发布 / 打回重写」两个按钮 —— 和命令行是**同一个** `interrupt()` 暂停点 |
+
+![trace 详情页](docs/img/page-trace.png)
+
+> 截图是真跑的一条：`deepseek-flash` 一次调用、¥0.0005、5 条 trace（retrieve / draft / factcheck / review / publish），
+> 放行是在页面上点的，发布稿落在 `outputs/`。没有命中资料的那类选题会停在「0 条可核查断言」，同样等人拍板。
+
+数据分两处存，都落在 `.contentops/`：轨迹进 `traces.sqlite`（`runs` + `events` 两张表），
+图状态进 `web.sqlite`（checkpointer）。命令行跑过的运行也会出现在列表里 —— 因为轨迹写的是同一个库。
+
+打回会真的重写一版再停回审核（版本号 +1）；放行才落 markdown 到 `outputs/`。
+服务默认只监听 `127.0.0.1`；要给别人看就 `--host 0.0.0.0` 或者走 Cloudflare Tunnel，
+**别把一个没有鉴权的页面直接扔到公网**。
+
 
 **用真实模型**：把 `.env.example` 复制成 `.env`（项目根目录的 `.env` 会被自动读取，规则跟 docker compose 一致：
 已存在的环境变量优先，`.env` 只补空），填 `DEEPSEEK_API_KEY` 和 `LLM_PROVIDER=deepseek`，
@@ -135,6 +181,7 @@ python -m contentops.cli eval --dataset evals\golden --out reports
 ```
 contentops-agent/
 ├── README.md
+├── 双击运行.cmd               # 演示入口：双击跑完整条流水线（批处理只放 ASCII，中文在 demo_run.py）
 ├── requirements.txt
 ├── Dockerfile                 # 单机镜像：非 root + HEALTHCHECK，不碰模型也能自检
 ├── docker-compose.yml         # 一条命令起容器；变量走 .env，没有就回落 mock
@@ -142,6 +189,7 @@ contentops-agent/
 ├── .env.example
 ├── .gitignore
 ├── .github/workflows/ci.yml   # push 即跑 pytest
+├── pytest.ini                 # 只收 tests/；排除 tests/_tmp（0o700 建的目录进不去）
 ├── evals/golden/              # 30 条黄金集（10 常规 / 10 边界 / 10 应拒答）
 ├── reports/                   # 评测报告（每改一次闸门/提示词就留一份，A→B 的出处）
 ├── docs/
@@ -152,6 +200,8 @@ contentops-agent/
 │   └── 简历回填模板.md
 ├── scripts/
 │   ├── dev.cmd                # 设好 PYTHONPATH 再跑，避免环境污染
+│   ├── demo_run.py            # 双击运行.cmd 真正调用的入口（中文标题/提示都在这里）
+│   ├── vendor_wheels.py       # pip 装不上时的备用路径：下 wheel 直接解到 .venv-libs
 │   ├── docker-smoke.ps1       # 容器验收：build → 健康检查 → 真跑一条 → 抽 5 条黄金集
 │   └── check_container_files.py  # 没装 Docker 时的静态校验（COPY 路径/变量/健康检查子命令）
 ├── src/contentops/
@@ -162,12 +212,16 @@ contentops-agent/
 │   ├── graph.py               # 图的组装 + 两条条件边 + 会话（checkpointer）工具
 │   ├── checkpoint.py          # SQLite checkpointer：状态落盘，跨进程恢复
 │   ├── eval.py                # 评测器：跑黄金集、算指标、留失败明细、记成本
-│   └── cli.py                 # 命令行入口（run / resume / kb / eval / llm-check）
+│   ├── trace_store.py         # trace 落库：runs + events 两张表（命令行和页面共用）
+│   ├── web.py                 # 极简页面（FastAPI）：列表 / 详情 / 放行打回
+│   ├── output.py              # 发布稿落成 markdown（命令行和页面共用）
+│   └── cli.py                 # 命令行入口（run / resume / kb / eval / llm-check / serve）
 └── tests/
     ├── test_smoke.py          # 链路能不能跑通
     ├── test_stage2.py         # 核查规则 / 中断 / 打回额度
     ├── test_stage3.py         # 评测器自身：数据集校验、闸门开关、失败明细
     ├── test_stage4.py         # SQLite checkpointer：真起子进程，A 暂停 → B 恢复
+    ├── test_stage5.py         # trace 落库幂等 + 页面跑完整个人工环（TestClient）
     └── test_llm.py            # 模型层：请求体、重试策略、记账口径、峰谷价（不联网）
 ```
 
@@ -175,22 +229,30 @@ contentops-agent/
 
 ## 五、评测（阶段 3 交付）
 
-30 条黄金集，三个版本的代码各跑一遍（完整口径见 [`docs/评测口径.md`](docs/评测口径.md)）：
+30 条黄金集，四份报告（mock 三版 + 真模型一版，完整口径见 [`docs/评测口径.md`](docs/评测口径.md)）：
 
 | 版本 | 引用命中率 | 事实一致性（代理） | 拒答准确率 | 端到端通过 | 平均 / P95 |
 |---|---|---|---|---|---|
-| v0.2 基线 | 100% | 7.5% | 10% | 4 / 30 | 32 / 41 ms |
-| v0.3 修检索与 mock，不开闸门 | 100% | 55.0% | 0% | 20 / 30 | 32 / 38 ms |
-| v0.3 加相关度闸门（0.09） | 100% | 91.7% | 100% | 30 / 30 | 33 / 40 ms |
+| v0.2 基线（mock） | 100% | 7.5% | 10% | 4 / 30 | 32 / 41 ms |
+| v0.3 修检索与 mock，不开闸门（mock） | 100% | 55.0% | 0% | 20 / 30 | 32 / 38 ms |
+| v0.3 加相关度闸门（0.09）（mock） | 100% | 91.7% | 100% | 30 / 30 | 33 / 40 ms |
+| v0.4 真模型 `deepseek-flash` | 100% | 98.1% | 100% | 30 / 30 | 1174 / 1634 ms |
 
-三件事值得说，因为都能被追问：
+真模型那一行来自 `reports/eval-20261119-0227-gated.md`：32 次调用、输入 4912 / 输出 1798 tokens、估算 ¥0.0120。
+它和 mock 基线在**行为**上一致（拦得住、拒得掉、不空转），差别是延迟和成本；98.1% 而不是 100% 的原因见下面第 4 条。
+
+四件事值得说，因为都能被追问：
 
 1. **7.5% 那个数是 bug**：mock 解析上下文时按空行分块，第一块开头是「资料：」，
    于是第 1 条资料被整条丢掉、永远只引第 2、3 条 —— 表上表现为「引用命中率 100%、事实一致性 7.5%」。
    修完是 55.0%。
 2. **拒答靠闸门**：检索最高分低于 0.09 就不写稿，不拿不相关段落硬凑。拒答 10% → 100%。
-3. **这组数不是模型质量**：mock 只会照抄资料，语义对不对机器没判。它测的是流水线的行为
-   （拦得住、拒得掉、不空转），换成真模型要重跑；也是因为这个，简历里没写「准确率 90%+」。
+3. **mock 那三行不是模型质量**：mock 只会照抄资料，语义对不对机器没判。它测的是流水线的行为
+   （拦得住、拒得掉、不空转）；所以同一套命令又用真模型跑了一遍（第 4 行），也是因为这个，
+   简历里没写「准确率 90%+」。
+4. **真模型的 98.1% 与 100% 差在哪**：54 条带引用断言里有 1 条，引用编号本身有效、但引到的小节不是
+   `must_cite` 期望小节，所以分母口径上掉到 98.1%；案例级仍判通过（通过判定是「发布 **且** 至少一条
+   断言引到 `must_cite`」）。这正是口径文档里那句「一致性是下界」——它不是拼错，是口径。
 
 > 现在这张表是**跑出来的**，不是估的。每改一次闸门或提示词，`reports/` 里都要多一份，
 > 对照着看 A→B —— 只报最新一次的数，等于没有基线。
@@ -232,8 +294,8 @@ powershell -ExecutionPolicy Bypass -File scripts\docker-smoke.ps1
 |---|---|---|---|
 | 0 地基 | 1 | git / 依赖 / 仓库 / README / CI | ✅ 已推到 GitHub，Actions 跑 pytest |
 | 1 最小闭环 | 5 | 三节点 + 检索 + mock 模型 | ✅ 命令行跑通、有 commit |
-| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，测试全绿（当前 37 条） |
-| 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | 🟡 评测出数（30/30）✅、checkpointer 跨进程 ✅、Docker 文件与验收脚本 ✅（本机待装 WSL2）；打包未做 |
+| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，测试全绿（当前 44 条） |
+| 3 工程化 | 5 | 评测集 + SQLite checkpointer + trace 落库与页面 + Docker + 打包 | 🟡 评测出数（30/30）✅、checkpointer 跨进程 ✅、trace 落库 + 页面 ✅、Docker 文件与验收脚本 ✅（本机待装 WSL2）；打包未做 |
 | 4 讲述 | 3 | 录屏 + 讲稿 + 10 问 | 脱稿 3 分钟讲完 |
 | 5 投递 | 持续 | 简历回填 + 投递表 | 每周 ≥10 家 |
 
@@ -247,7 +309,7 @@ powershell -ExecutionPolicy Bypass -File scripts\docker-smoke.ps1
 
 | 现象 | 真实原因 | 解法 |
 |---|---|---|
-| `pip install` 报 `PermissionError: ...whl` | Python 3.14 会把 `os.mkdir(mode=0o700)` 应用到目录 DACL，而 `tempfile.mkdtemp()` 默认就用 0o700；受限令牌因此进不去自己刚建的目录 | 用一个包装脚本把 0o700 改成 0o777 再调 pip（见提交历史里的 `pipx.py`） |
+| `pip install` 报 `PermissionError: ...whl` / `pytest` 报 `...pytest-of-<用户>` | Python 3.14 会把 `os.mkdir(mode=0o700)` 应用到目录 DACL，而 `tempfile.mkdtemp()` 默认就用 0o700；受限令牌因此进不去自己刚建的目录 | 两条路：把 0o700 改成 0o777 再调 pip（提交历史里的 `pipx.py`）；或者绕开 pip —— `python scripts/vendor_wheels.py fastapi==0.115.14 starlette==0.46.2 uvicorn==0.34.0 python-multipart` 直接把 wheel 解到 `.venv-libs`。测试里同理：不用 `tmp_path`，用 `tests/conftest.py` 的 `work` fixture |
 | `git push` 报 `error adding trust anchors from file: ...ca-bundle.crt` | MinGit 的 OpenSSL 打不开带中文的 CA 路径（工作区目录名里有中文） | 把 `ca-bundle.crt` 复制到纯 ASCII 目录（如 `%TEMP%`），`git -c http.sslCAInfo=<该路径> push` |
 | `git push` 报 `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` | 受限令牌下 schannel 拿不到凭据链 | `git -c http.sslBackend=openssl`（仓库里 `tools/gitconfig` 已默认这么配） |
 | `.ps1` 里的中文全变乱码、报「字符串缺少终止符」 | PowerShell 5.1 读**无 BOM** 的 UTF-8 脚本时按 GBK 解 | 脚本一律存成 UTF-8 **with BOM**；`scripts/check_container_files.py` 里有一条断言守着这个 |

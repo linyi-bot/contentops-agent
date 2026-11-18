@@ -3,6 +3,9 @@
 
 # 依赖（本机是 --target 安装到 .venv-libs，不提交）
 .venv-libs/
+# pip 在这个沙箱里写不了临时文件，绕开 pip 时留下的 wheel 缓存
+.wheels/
+.probe_pkg/
 .piptmp*/
 venv/
 .venv/
@@ -11,6 +14,8 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+# pytest 在这个环境里留下的缓存目录：0o700 建的，删不掉也读不了（见 README 第八节）
+pytest-cache-files-*/
 *.egg-info/
 tests/_tmp/
 

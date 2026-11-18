@@ -6,5 +6,12 @@ pydantic>=2.7
 # 跨进程恢复（contentops run --db）：SQLite 版 checkpointer
 langgraph-checkpoint-sqlite>=3.1,<4
 
+# 页面（contentops serve）：只用到最简单的路由 + 表单，不需要 ORM / 模板引擎 / 前端构建
+# 版本上限：fastapi 0.164 起 import 就要 opentelemetry，页面用不着那一坨
+fastapi>=0.115,<0.120
+starlette>=0.46,<0.48
+uvicorn>=0.34,<0.40
+python-multipart>=0.0.20
+
 # 测试
 pytest>=8

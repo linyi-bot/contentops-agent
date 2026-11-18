@@ -12,15 +12,15 @@
     :: 进程 B：换一个终端/第二天，接着发布
     python -m contentops.cli resume --thread-id demo --db .contentops\\state.sqlite --decision approve --out outputs
 
-刻意不做 Web UI：命令行把「检索 → 草稿 → 核查 → 人工审核 → 发布」全流程打印出来，
-录屏讲项目时一屏就能讲清楚，比一个要装一堆前端依赖的页面更稳。
+命令行把「检索 → 草稿 → 核查 → 人工审核 → 发布」全流程打印出来，录屏一屏能讲清；
+`serve` 另起一个极简页面（同一套图、同一个 sqlite 落盘），给「在浏览器里放行 / 打回」
+和「翻历史 trace」用 —— 页面只是命令行的一个视图，不是另一条链路。
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -33,8 +33,10 @@ from .graph import (
     start,
 )
 from .llm import build_llm, describe, usage_snapshot
+from .output import write_markdown
 from .retriever import Retriever
 from .state import ContentState
+from .trace_store import TraceStore, usage_delta
 
 LINE = "=" * 66
 
@@ -129,28 +131,25 @@ def _print_model() -> None:
 
 def _write_output(state: ContentState, out_dir: Path) -> Path:
     """把发布记录落成一篇 markdown —— 这一步有副作用，所以只放在 CLI 里。"""
-    published = state.get("published") or {}
-    title = str(published.get("title") or "untitled")
-    slug = re.sub(r"[^\w\u4e00-\u9fff]+", "-", title).strip("-")[:40] or "untitled"
+    return write_markdown(state, out_dir)
 
-    lines = [f"# {title}", "", published.get("body", ""), "", "## 来源"]
-    for s in published.get("sources", []):
-        where = f"《{s['doc']}》" + (f" · {s['heading']}" if s["heading"] else "")
-        lines.append(f"- [{s['index']}] {where}")
-    if published.get("unchecked"):
-        lines += ["", "## 未核实断言（发布时人工已知情）"]
-        lines += [f"- {u}" for u in published["unchecked"]]
-    lines += [
-        "",
-        "---",
-        f"发布闸门：{published.get('gate')}　版本：第 {published.get('revision')} 版　"
-        f"时间：{published.get('published_at')}",
-    ]
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{slug}.md"
-    path.write_text("\n".join(lines), encoding="utf-8")
-    return path
+def _sync_trace(
+    state: ContentState,
+    *,
+    run_id: str,
+    db: str,
+    usage: tuple[int, int, int, float] | None = None,
+) -> None:
+    """把这一段的 trace 写进 sqlite，让 `contentops serve` 的页面能看到。
+
+    观测是**旁路**：它挂了也不该让一条本来能跑完的流水线失败，
+    所以这里只打印一行警告，不往上抛。
+    """
+    try:
+        TraceStore().sync(state, run_id=run_id, db=db, mode=describe()["label"], usage=usage)
+    except Exception as exc:  # noqa: BLE001 - 落库失败不该拖垮主流程
+        print(f"\n[!] trace 落库失败（不影响本次运行）：{type(exc).__name__}: {exc}")
 
 
 def _db_arg(value: str) -> str:
@@ -200,7 +199,10 @@ def _emit_result(state: ContentState, args: argparse.Namespace) -> int:
 def _cmd_run(args: argparse.Namespace) -> int:
     db = _db_arg(args.db)
     with session(args.thread_id or None, db=db or None) as (app, tid):
+        u0 = usage_snapshot()
         state = start(app, args.topic, tid)
+        u1 = usage_snapshot()
+        _sync_trace(state, run_id=tid, db=db, usage=usage_delta(u0, u1))
 
         print(LINE)
         print(f"选题：{state.get('topic')}　会话：{tid}")
@@ -223,7 +225,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         while is_interrupted(state) and rounds < 6:
             packet = interrupt_payload(state)
             _print_packet(packet)
+            u0 = usage_snapshot()
             state = resume(app, _ask(packet, args.auto), tid)
+            u1 = usage_snapshot()
+            _sync_trace(state, run_id=tid, db=db, usage=usage_delta(u0, u1))
             rounds += 1
 
         if is_interrupted(state):
@@ -251,6 +256,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         print(f"\n【恢复】会话 {tid} ← {args.decision}（附言：{args.note or '无'}）")
 
         state = resume(app, {"decision": args.decision, "note": args.note}, tid)
+        _sync_trace(state, run_id=tid, db=db)
 
         if is_interrupted(state):
             print("\n【又停在审核】上一轮打回后已重写一版，还是等你答复。")
@@ -332,6 +338,14 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     return 0 if report["counts"]["passed"] == report["counts"]["cases"] else 2
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    """起极简页面：跑一条 / 看 trace 时间线 / 在浏览器里放行或打回。"""
+    from . import web
+
+    print(f"页面：http://{args.host}:{args.port}　（Ctrl+C 停；服务默认只监听本机）")
+    return web.serve(host=args.host, port=args.port)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="contentops", description="ContentOps Agent")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -394,6 +408,11 @@ def main(argv: list[str] | None = None) -> int:
     pe.add_argument("--label", default="", help="报告文件名后缀，如 v0.3-gated（留空按阈值自动取）")
     pe.add_argument("--json", action="store_true", help="打印完整报告 JSON")
     pe.set_defaults(func=_cmd_eval)
+
+    pv = sub.add_parser("serve", help="起极简页面：跑一条 / 看 trace / 放行打回")
+    pv.add_argument("--host", default="127.0.0.1", help="监听地址（默认只监听本机）")
+    pv.add_argument("--port", type=int, default=8000)
+    pv.set_defaults(func=_cmd_serve)
 
     args = p.parse_args(argv)
     return args.func(args)
