@@ -34,6 +34,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -66,6 +67,81 @@ RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 class LLMError(RuntimeError):
     """模型调用失败。带上人话原因，别让调用方去猜 HTTP 码。"""
+
+
+# --------------------------------------------------------------------------- #
+# .env：没有它，README 里「填 .env 再跑」是句空话
+# --------------------------------------------------------------------------- #
+
+#: 项目根目录（src/contentops/llm.py 往上三层）
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+_dotenv_loaded = False
+
+
+def parse_dotenv(text: str) -> dict[str, str]:
+    """解析 `KEY=VALUE` 行。
+
+    不引 python-dotenv：为了读十行配置多一个依赖不划算。
+    语义跟 docker compose 对齐：`#` 开头是注释、允许 `export `、值可以带引号，
+    行尾的「空格 + #」当注释切掉（key 里不会出现空格+#，这样切是安全的）。
+    """
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("\ufeff")  # 防 BOM 混进第一行的 key
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] in {'"', "'"} and value[-1] == value[0]:
+            value = value[1:-1]
+        else:
+            value = re.sub(r"\s+#.*$", "", value).strip()
+        out[key] = value
+    return out
+
+
+def load_dotenv(path: Path | str | None = None, *, force: bool = False) -> int:
+    """把 `.env` 读进 `os.environ`，**已存在的变量一律不覆盖**。
+
+    为什么必须「不覆盖」：CI 里靠真环境变量注入、docker 里靠 compose 注入，
+    如果 .env 能盖掉它们，那台机器上就永远调不到正确的配置。
+    返回真正补进去的条数（0 表示没读或全都已存在）。
+    """
+    global _dotenv_loaded
+    if _dotenv_loaded and not force:
+        return 0
+    _dotenv_loaded = True
+    if os.getenv("CONTENTOPS_NO_DOTENV", "").strip():
+        return 0  # 测试里关掉：本地填了 key 也不该让单测真的去调模型
+
+    candidates: list[Path] = []
+    if path is not None:
+        candidates.append(Path(path))
+    else:
+        candidates += [PROJECT_ROOT / ".env", Path.cwd() / ".env"]
+
+    added = 0
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen or not candidate.is_file():
+            continue
+        seen.add(candidate)
+        # utf-8-sig：Windows 记事本 / PowerShell 的 Set-Content 默认会写 BOM，
+        # 用 utf-8 读会把首行的 key 读成 "\ufeffLLM_PROVIDER"，然后静默失效。
+        raw = candidate.read_text(encoding="utf-8-sig")
+        for key, value in parse_dotenv(raw).items():
+            if key not in os.environ:
+                os.environ[key] = value
+                added += 1
+    return added
 
 
 # --------------------------------------------------------------------------- #
@@ -457,6 +533,7 @@ def _client(
 
 def build_llm() -> LLM:
     """按环境变量选模型；没有 key 就回落 mock，绝不因为缺 key 而崩。"""
+    load_dotenv()  # 让「复制 .env.example 成 .env 再跑」真的生效
     provider = os.getenv("LLM_PROVIDER", "mock").strip().lower()
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
 
@@ -476,6 +553,7 @@ def build_llm() -> LLM:
 
 def describe() -> dict[str, Any]:
     """当前会用哪个模型 —— 打印在 CLI 头上，别让人猜这轮花没花钱。"""
+    load_dotenv()
     provider = os.getenv("LLM_PROVIDER", "mock").strip().lower()
     has_key = bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
     if provider in {"deepseek", "openai", "compat"} and has_key:

@@ -3,7 +3,7 @@
 [![CI](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1f6feb)
-![Tests](https://img.shields.io/badge/tests-34%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-37%20passed-brightgreen)
 
 > 内容运营多智能体工作台 · LangGraph 编排 · 可评测、可观测、可复现
 
@@ -110,7 +110,8 @@ python -m contentops.cli eval --dataset evals\golden --out reports
 默认用内存 checkpointer（clone 下来零配置能跑）；加上 `--db` 就换成 SQLite checkpointer ——
 状态落盘，**进程退出了也能换一个进程接着发**，`resume --decision reject` 打回后会在新进程里重写一版、再次停在审核。
 
-**用真实模型**：把 `.env.example` 复制成 `.env`，填 `DEEPSEEK_API_KEY` 和 `LLM_PROVIDER=deepseek`，
+**用真实模型**：把 `.env.example` 复制成 `.env`（项目根目录的 `.env` 会被自动读取，规则跟 docker compose 一致：
+已存在的环境变量优先，`.env` 只补空），填 `DEEPSEEK_API_KEY` 和 `LLM_PROVIDER=deepseek`，
 然后先跑 `scripts\dev.cmd llm-check` 验通路（只花几十个 token），再跑正式流程。没填 key 时自动回落到 mock，
 保证「clone 下来就能跑」——这是阶段 0 的验收线之一。
 
@@ -231,7 +232,7 @@ powershell -ExecutionPolicy Bypass -File scripts\docker-smoke.ps1
 |---|---|---|---|
 | 0 地基 | 1 | git / 依赖 / 仓库 / README / CI | ✅ 已推到 GitHub，Actions 跑 pytest |
 | 1 最小闭环 | 5 | 三节点 + 检索 + mock 模型 | ✅ 命令行跑通、有 commit |
-| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，测试全绿（当前 34 条） |
+| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，测试全绿（当前 37 条） |
 | 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | 🟡 评测出数（30/30）✅、checkpointer 跨进程 ✅、Docker 文件与验收脚本 ✅（本机待装 WSL2）；打包未做 |
 | 4 讲述 | 3 | 录屏 + 讲稿 + 10 问 | 脱稿 3 分钟讲完 |
 | 5 投递 | 持续 | 简历回填 + 投递表 | 每周 ≥10 家 |

@@ -8,7 +8,11 @@
 """
 from __future__ import annotations
 
+import os
+import shutil
+import uuid
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -181,3 +185,54 @@ def test_price_switches_between_peak_and_offpeak(monkeypatch):
 def test_unknown_model_falls_back_to_default_price_table(monkeypatch):
     monkeypatch.setattr(L, "is_peak", lambda *a, **kw: False)
     assert L.price_for("deepseek-chat") == L.price_for(L.DEFAULT_MODEL)
+
+
+def test_parse_dotenv_handles_comments_quotes_and_export():
+    text = """
+# 注释行
+LLM_PROVIDER=deepseek
+export LLM_MODEL="deepseek-flash"
+DEEPSEEK_API_KEY=sk-abc  # 行尾注释
+这行没有等号
+"""
+    parsed = L.parse_dotenv(text)
+    assert parsed == {
+        "LLM_PROVIDER": "deepseek",
+        "LLM_MODEL": "deepseek-flash",
+        "DEEPSEEK_API_KEY": "sk-abc",
+    }
+
+
+@pytest.fixture()
+def workdir():
+    """不用 pytest 自带的 tmp_path：这台机器的临时目录 ACL 会让沙箱里的 pytest 报拒绝访问。"""
+    d = Path(__file__).resolve().parent / "_tmp" / uuid.uuid4().hex[:8]
+    d.mkdir(parents=True)
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_parse_dotenv_survives_bom_from_windows_editors():
+    """记事本 / PowerShell 写 .env 会带 BOM，首行 key 不能变成 "\\ufeffLLM_PROVIDER"。"""
+    parsed = L.parse_dotenv("\ufeffLLM_PROVIDER=deepseek\nDEEPSEEK_API_KEY=sk-x\n")
+    assert parsed["LLM_PROVIDER"] == "deepseek"
+    assert parsed["DEEPSEEK_API_KEY"] == "sk-x"
+
+
+def test_load_dotenv_never_overrides_real_env(monkeypatch, workdir):
+    """CI 用环境变量注入、docker 用 compose 注入，.env 只该补空，不该盖掉它们。"""
+    monkeypatch.delenv("CONTENTOPS_NO_DOTENV", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER", "deepseek")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    env_file = workdir / ".env"
+    env_file.write_text("LLM_PROVIDER=mock\nLLM_MODEL=deepseek-v4-pro\n", encoding="utf-8")
+
+    added = L.load_dotenv(env_file, force=True)
+    assert os.environ["LLM_PROVIDER"] == "deepseek", "已存在的环境变量优先，不能被 .env 盖掉"
+    assert os.environ["LLM_MODEL"] == "deepseek-v4-pro"
+    assert added == 1
+
+    assert L.load_dotenv(env_file, force=True) == 0, "第二次读同一个文件不该再补任何东西"
