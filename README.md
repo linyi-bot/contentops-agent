@@ -13,12 +13,12 @@ AI Agent 岗位的 JD 里反复出现这 7 个词，本项目一个不落地覆�
 
 | JD 关键词 | 在本项目里对应什么 | 状态 |
 |---|---|---|
-| 编排（Orchestration） | LangGraph `StateGraph`，六节点 + 条件边 | 阶段 2 |
-| 工具调用（Tool Use） | 检索 / 抓取 / 发布三类工具，带参数 schema | 阶段 1（检索已完成） |
-| RAG 检索增强 | 本地知识库 → 分块 → 检索 → 拼上下文 | 阶段 1 已完成 |
+| 编排（Orchestration） | LangGraph `StateGraph`，六节点 + 两条条件边（核查回写、人工打回） | ✅ 已完成 |
+| 工具调用（Tool Use） | 检索工具已按 schema 接入；抓取 / 发布工具 | 检索 ✅，其余阶段 3 |
+| RAG 检索增强 | 本地知识库 → 按二级标题分块 → BM25 式打分 → 拼上下文 | ✅ 已完成 |
 | 评测（Eval） | 30 条黄金集，4 个指标出报告 | 阶段 3 |
-| 可观测（Observability） | 自建 trace 表 + 查看页，不依赖付费平台 | 阶段 3 |
-| 人工中断（Human-in-the-loop） | `interrupt` 暂停等人工放行 | 阶段 2 |
+| 可观测（Observability） | 自建 trace：每节点耗时 + 一句人话 | trace ✅，报告页阶段 3 |
+| 人工中断（Human-in-the-loop） | `interrupt()` 真暂停 + checkpointer 可恢复 | ✅ 已完成 |
 | 部署（Deploy） | Docker 单机 + 公网隧道 | 阶段 3 |
 
 ---
@@ -36,28 +36,59 @@ flowchart LR
     E -->|放行| F[发布 publish]
 ```
 
-当前已实现（阶段 1）的是最小闭环，三个节点：
+当前已实现的是完整六节点闭环（阶段 1 的三节点 → 阶段 2 补齐核查、审核、发布）：
 
 ```
-选题 ──▶ 检索(RAG) ──▶ 起草 ──▶ 输出
-         │              │
-         └─ docs/kb/ ───┘   ← 每次运行都留 trace
+选题 ──▶ 检索(RAG) ──▶ 起草 ──▶ 事实核查 ──┬─有未核实断言──▶ 起草（最多 3 版）
+         │              │                │
+         └─ docs/kb/ ───┘                └─通过──▶ 人工审核(interrupt) ──┬─放行──▶ 发布
+                                                                └─打回──▶ 起草（吃同一个额度）
 ```
+
+### 核查与闸门（阶段 2 的判断规则）
+
+事实核查只做两件**可机器判**的事，不做「语义上支不支持」的假装判断：
+
+1. 每条断言必须带 `[n]`，且 n 落在本次检索到的条数范围内；
+2. 被引那一段里，得能找到这条断言至少 2 个实字（或 1 个数字/单词）—— 专抓「引错了段」。
+
+不通过的三类原因会原样进审核包：`没有引用标记` / `引用编号 N 不存在` / `引用 [N] 的段落里找不到这条断言的关键词`。
+语义是否真的支持，留给人工 —— 这就是为什么下一个节点是 `interrupt()` 而不是自动发布。
+
+三道闸门：
+
+| 闸门 | 规则 | 代码位置 |
+|---|---|---|
+| 有证据 | 核查不过就回写，但最多 `MAX_REVISION=3` 版 | `graph.route_after_factcheck` |
+| 有出路 | 零命中或额度用尽 → 交人，不空转 | 同上 |
+| 不裸发 | 没有可核查断言（空稿、零命中）也**不算通过**，必须人工确认；发布记录里标 `forced` | `nodes.factcheck_node` / `nodes.publish_node` |
 
 ---
 
 ## 三、快速开始
 
 ```bat
-:: 1) 依赖（本机已装好，见 .venv-libs；换机器时执行下一行）
-python ..\tools\pipx.py install --target .venv-libs -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+:: 1) 依赖
+python -m pip install -r requirements.txt
 
-:: 2) 跑一次（默认 mock 模型，不需要 API key）
-scripts\dev.cmd run --topic "用 AI 做周报自动化"
+:: 2) 让它知道自己是 src 布局的包（Windows 下 set，mac/linux 用 export）
+set PYTHONPATH=src
 
-:: 3) 测试
-scripts\dev.cmd test
+:: 3) 跑一次：会停在【人工审核】，敲 y 放行 / n 打回（可跟一句附言）
+python -m contentops.cli run --topic "用 AI 做周报自动化"
+
+:: 4) 免交互跑完，并把发布记录落成 markdown（CI / 录屏用这个）
+python -m contentops.cli run --topic "用 AI 做周报自动化" --auto approve --out outputs
+
+:: 5) 测试
+python -m pytest -q
 ```
+
+`scripts\dev.cmd` 只是把第 2 步和启动命令包了一下（Windows 专用，省得每次设环境变量）。
+
+**人工审核长什么样**：图停在 `review` 节点，把审核包（选题、第几版、草稿、每条断言的核查结论）打印出来，
+然后等一个答复。答复是 `Command(resume=...)` 喂回图的，不是命令行参数 ——
+所以「今天先不发，明天接着发」是可行的（阶段 3 换成 SQLite checkpointer 就能跨进程）。
 
 **用真实模型**：把 `.env.example` 复制成 `.env`，填 `DEEPSEEK_API_KEY`，
 然后 `set LLM_PROVIDER=deepseek` 再运行。没填 key 时自动回落到 mock，
@@ -73,20 +104,23 @@ contentops-agent/
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
+├── .github/workflows/ci.yml   # push 即跑 pytest
 ├── docs/
 │   ├── kb/                    # 知识库（检索的语料，纯 markdown）
-│   └── 评测口径.md             # 指标定义，阶段 3 填数
+│   ├── 评测口径.md             # 指标定义，阶段 3 填数
+│   └── 简历回填模板.md
 ├── scripts/
 │   └── dev.cmd                # 设好 PYTHONPATH 再跑，避免环境污染
 ├── src/contentops/
-│   ├── state.py               # 图的状态定义（TypedDict + reducer）
+│   ├── state.py               # 图的状态定义（含断言 Claim 与审核包 ReviewPacket）
 │   ├── llm.py                 # 模型层：mock / deepseek 统一接口
 │   ├── retriever.py           # 知识库分块与检索
-│   ├── nodes.py               # 节点实现
-│   ├── graph.py               # 图的组装
-│   └── cli.py                 # 命令行入口
+│   ├── nodes.py               # 五个节点：检索 / 起草 / 核查 / 审核 / 发布
+│   ├── graph.py               # 图的组装 + 两条条件边 + 会话（checkpointer）工具
+│   └── cli.py                 # 命令行入口（含人工审核交互）
 └── tests/
-    └── test_smoke.py
+    ├── test_smoke.py          # 链路能不能跑通
+    └── test_stage2.py         # 核查规则 / 中断 / 打回额度
 ```
 
 ---
@@ -108,10 +142,10 @@ contentops-agent/
 
 | 阶段 | 天数 | 产出 | 验收线 |
 |---|---|---|---|
-| 0 地基 | 1 | git / 依赖 / 仓库 / README | `git push` 成功（待 GitHub 认证） |
+| 0 地基 | 1 | git / 依赖 / 仓库 / README / CI | `git push` 成功（待 GitHub 认证） |
 | 1 最小闭环 | 5 | 三节点 + 检索 + mock 模型 | 命令行跑通、有 commit ✅ |
-| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 | 输入选题产出带引用稿子 |
-| 3 工程化 | 5 | 评测集 + trace + Docker | pytest 绿、评测出报告 |
+| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 输入选题产出带引用稿子，12 条测试全绿 |
+| 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | pytest 绿、评测出报告 |
 | 4 讲述 | 3 | 录屏 + 讲稿 + 10 问 | 脱稿 3 分钟讲完 |
 | 5 投递 | 持续 | 简历回填 + 投递表 | 每周 ≥10 家 |
 
