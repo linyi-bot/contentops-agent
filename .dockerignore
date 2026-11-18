@@ -10,6 +10,10 @@
 .env.local
 .venv*
 .piptmp*
+# 本机 pip/setuptools 的临时目录（0o700 建出来的删不掉，见 README 第九节）
+.tmp
+tmp*/
+pip-*
 .probe
 .pytest_cache
 __pycache__
