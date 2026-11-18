@@ -1,20 +1,14 @@
 @echo off
-:: ContentOps Agent 开发入口
-:: 作用：把 src 和本地依赖目录加进 PYTHONPATH，再跑命令，避免污染系统 Python。
-::
-::   scripts\dev.cmd run --topic "用 AI 做周报自动化"
-::   scripts\dev.cmd kb --query "事实核查"
-::   scripts\dev.cmd test
-
 setlocal
+chcp 65001 >nul
 set "ROOT=%~dp0.."
+cd /d "%ROOT%"
 set "PYTHONPATH=%ROOT%\src;%ROOT%\.venv-libs"
 set "PYTHONIOENCODING=utf-8"
 
 if /i "%1"=="test" (
-    shift
-    :: -p no:cacheprovider：这台机器上 pytest 的缓存目录会被沙箱拦住，不是必须功能
-    python -m pytest -q -p no:cacheprovider %*
+    rem shift does not change %* -- take %2..%9 explicitly
+    python -m pytest -q -p no:cacheprovider tests %2 %3 %4 %5 %6 %7 %8 %9
     exit /b %ERRORLEVEL%
 )
 
