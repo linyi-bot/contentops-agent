@@ -4,6 +4,10 @@
 
 .git
 .github
+# 密钥不进构建上下文：Dockerfile 本来只 COPY src/ 与 docs/kb/，
+# 但 context 是先整个打包发给 daemon 的，.env 里的 key 没必要跟着上路上机。
+.env
+.env.local
 .venv*
 .piptmp*
 .probe
