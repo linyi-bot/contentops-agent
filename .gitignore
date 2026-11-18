@@ -1,0 +1,25 @@
+# 密钥与本地配置
+.env
+
+# 依赖（本机是 --target 安装到 .venv-libs，不提交）
+.venv-libs/
+.piptmp/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# 运行产物
+data/
+reports/
+*.log
+
+# 编辑器与系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

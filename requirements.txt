@@ -1,0 +1,8 @@
+# 运行依赖（Python 3.11+）
+langgraph>=1.2,<2
+langchain-core>=1.8,<2
+httpx>=0.28
+pydantic>=2.7
+
+# 测试
+pytest>=8
