@@ -1,0 +1,58 @@
+[build-system]
+# 只用 setuptools：纯 Python 包，没有编译步骤，不需要 hatchling/poetry 那一层
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contentops-agent"
+# 版本号跟评测口径走：v0.4 = deepseek-flash 真模型那一版（reports/eval-*-v0.4-deepseek.md）
+version = "0.4.0"
+description = "内容运营多智能体工作台：检索 → 起草 → 事实核查 → 人工审核 → 发布，带评测、trace 与页面"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "林毅", email = "2142385813@qq.com" }]
+keywords = ["llm", "agent", "langgraph", "rag", "eval", "human-in-the-loop"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+    "Environment :: Console",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+# 与 requirements.txt 一一对应；上限是踩过的坑，不是抄来的：
+#   fastapi 0.164 一 import 就要 opentelemetry，页面用不着；uvicorn 0.54 与 0.34 行为不同
+#   langgraph 2.x 尚未验证过 checkpointer 的接口，先卡在 1.x
+dependencies = [
+    "langgraph>=1.2,<2",
+    "langchain-core>=1.8,<2",
+    "langgraph-checkpoint-sqlite>=3.1,<4",
+    "httpx>=0.28",
+    "pydantic>=2.7",
+    "fastapi>=0.115,<0.120",
+    "starlette>=0.46,<0.48",
+    "uvicorn>=0.34,<0.40",
+    "python-multipart>=0.0.20",
+]
+
+[project.optional-dependencies]
+# 跑测试要的（pytest 不进运行依赖：装到镜像里只是白占体积）
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/linyi-bot/contentops-agent"
+Issues = "https://github.com/linyi-bot/contentops-agent/issues"
+
+[project.scripts]
+# 装完就有一个 contentops 命令，等价于 python -m contentops.cli。
+# 返回码原样透出（0=发布 / 75=停在人工审核），脚本才能判「暂停」和「失败」的区别
+contentops = "contentops.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+contentops = ["py.typed"]

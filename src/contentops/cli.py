@@ -1,20 +1,26 @@
 """命令行入口。
 
-    python -m contentops.cli run --topic "用 AI 做周报自动化"          # 会停在人工审核，等你敲 y/n
-    python -m contentops.cli run --topic "..." --auto approve          # 不给 stdin 也能跑完
-    python -m contentops.cli run --topic "..." --auto approve --out outputs
+    contentops run --topic "用 AI 做周报自动化"                 # 会停在人工审核，等你敲 y/n
+    contentops run --topic "..." --auto approve                 # 不给 stdin 也能跑完
+    contentops run --topic "..." --auto approve --out outputs
+
+没把 `contentops` 装成命令时（`pip install -e .` 之前），把上面三条里的 `contentops`
+换成 `python -m contentops.cli`，参数一模一样。
 
 跨进程恢复（阶段 3 的 SQLite checkpointer）：
 
     :: 进程 A：停在审核就退出，返回码 75
-    python -m contentops.cli run --topic "..." --db .contentops\\state.sqlite --thread-id demo --pause
+    contentops run --topic "..." --db .contentops\\state.sqlite --thread-id demo --pause
 
     :: 进程 B：换一个终端/第二天，接着发布
-    python -m contentops.cli resume --thread-id demo --db .contentops\\state.sqlite --decision approve --out outputs
+    contentops resume --thread-id demo --db .contentops\\state.sqlite --decision approve --out outputs
 
 命令行把「检索 → 草稿 → 核查 → 人工审核 → 发布」全流程打印出来，录屏一屏能讲清；
 `serve` 另起一个极简页面（同一套图、同一个 sqlite 落盘），给「在浏览器里放行 / 打回」
 和「翻历史 trace」用 —— 页面只是命令行的一个视图，不是另一条链路。
+
+退出码是合同的一部分（`contentops` 与 `python -m` 完全一致）：
+0 = 已发布 / 75 = 停在人工审核 / 其他 = 出错。
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ import os
 import sys
 from pathlib import Path
 
+from . import __version__
 from .graph import (
     config_for,
     interrupt_payload,
@@ -169,7 +176,8 @@ def _pause_hint(tid: str, db: str) -> str:
             f"\n【已暂停】会话 {tid} 的状态已落盘，这个进程现在就可以退出",
             f"  状态库：{Path(db).resolve()}",
             "  换一个进程接着发：",
-            f'    python -m contentops.cli resume --thread-id {tid} --db "{db}" --decision approve',
+            f'    contentops resume --thread-id {tid} --db "{db}" --decision approve',
+            f'    （没把 contentops 装成命令的话：python -m contentops.cli resume ... 一样）',
             '  （--decision reject --note "哪里不行" 则打回重写一版）',
         ]
     )
@@ -348,6 +356,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="contentops", description="ContentOps Agent")
+    p.add_argument("--version", action="version", version=f"contentops {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pr = sub.add_parser("run", help="跑一条完整流水线（含人工审核）")

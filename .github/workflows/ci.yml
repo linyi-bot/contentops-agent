@@ -15,11 +15,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install (as a package)
+        # 故意不用 requirements.txt + PYTHONPATH：装上之后再跑测试，顺手把
+        # pyproject.toml 的 src 布局、控制台入口、依赖声明在 py3.12 上验一遍。
+        run: pip install -e ".[test]"
+
+      - name: Smoke the console script
+        run: |
+          contentops --version
+          contentops kb --query 周报 | head -5
 
       - name: Run tests
-        run: PYTHONPATH=src pytest -q -p no:cacheprovider
+        run: pytest -q -p no:cacheprovider
 
       # 容器化文件没有 docker 也能查：COPY 路径在不在、compose 变量有没有声明、
       # 健康检查调的子命令注册没注册。真 build 要等装好 Docker，见看板 S3-07。

@@ -3,7 +3,7 @@
 [![CI](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1f6feb)
-![Tests](https://img.shields.io/badge/tests-44%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-55%20passed-brightgreen)
 
 > 内容运营多智能体工作台 · LangGraph 编排 · 可评测、可观测、可复现
 
@@ -80,33 +80,42 @@ flowchart LR
 git clone https://github.com/linyi-bot/contentops-agent.git
 cd contentops-agent
 
-:: 1) 依赖
-python -m pip install -r requirements.txt
+:: 1) 装成一条命令（推荐）：之后第 3–8 步里的 python -m contentops.cli 都可换成 contentops
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e ".[test]"
+contentops --version
 
-:: 2) 让它知道自己是 src 布局的包（Windows 下 set，mac/linux 用 export）
+:: 1b) 不想装 / 没权限装也行：装依赖 + 只给当前终端设 PYTHONPATH（mac/linux 用 export）
+python -m pip install -r requirements.txt
 set PYTHONPATH=src
 
 :: 3) 跑一次：会停在【人工审核】，敲 y 放行 / n 打回（可跟一句附言）
-python -m contentops.cli run --topic "用 AI 做周报自动化"
+contentops run --topic "用 AI 做周报自动化"
 
 :: 4) 免交互跑完，并把发布记录落成 markdown（CI / 录屏用这个）
-python -m contentops.cli run --topic "用 AI 做周报自动化" --auto approve --out outputs
+contentops run --topic "用 AI 做周报自动化" --auto approve --out outputs
 
 :: 5) 跨进程恢复：A 跑到审核就退出（返回码 75），B 第二天接着发布
-python -m contentops.cli run --topic "用 AI 做周报自动化" --db .contentops\state.sqlite --thread-id demo --pause
-python -m contentops.cli resume --thread-id demo --db .contentops\state.sqlite --decision approve --out outputs
+contentops run --topic "用 AI 做周报自动化" --db .contentops\state.sqlite --thread-id demo --pause
+contentops resume --thread-id demo --db .contentops\state.sqlite --decision approve --out outputs
 
 :: 6) 测试
 python -m pytest -q
 
 :: 7) 评测：30 条黄金集 → 汇总表 + 失败明细（报告写进 reports\）
-python -m contentops.cli eval --dataset evals\golden --out reports
+contentops eval --dataset evals\golden --out reports
 
 :: 8) 页面：trace 时间线 + 在浏览器里放行 / 打回
-python -m contentops.cli serve --port 8000
+contentops serve --port 8000
 ```
 
-`scripts\dev.cmd` 只是把第 2 步和启动命令包了一下（Windows 专用，省得每次设环境变量）。
+`install -e` 装出来的是同一条链路，不是另一个壳：`contentops` 就是 `contentops.cli:main`，
+连返回码都一个样（0=已发布 / 75=停在人工审核）。为什么非要有这个命令：录屏和简历里
+`contentops run --topic "..."` 比「三个环境变量 + 长路径 + python -m」更像一个真东西；
+细节和本机踩的两个坑在第九节。
+
+`scripts\dev.cmd` 只是把 1b 那步和启动命令包了一下（Windows 专用，省得每次设环境变量）。
 
 ### 双击就能跑（演示 / 录屏用）
 
@@ -182,6 +191,7 @@ python -m contentops.cli serve --port 8000
 contentops-agent/
 ├── README.md
 ├── 双击运行.cmd               # 演示入口：双击跑完整条流水线（批处理只放 ASCII，中文在 demo_run.py）
+├── pyproject.toml             # 打包：src 布局 + 控制台入口 contentops + 依赖 + [test] extra
 ├── requirements.txt
 ├── Dockerfile                 # 单机镜像：非 root + HEALTHCHECK，不碰模型也能自检
 ├── docker-compose.yml         # 一条命令起容器；变量走 .env，没有就回落 mock
@@ -201,6 +211,8 @@ contentops-agent/
 ├── scripts/
 │   ├── dev.cmd                # 设好 PYTHONPATH 再跑，避免环境污染
 │   ├── demo_run.py            # 双击运行.cmd 真正调用的入口（中文标题/提示都在这里）
+│   ├── venv_bootstrap.py      # 本机准备一个「真能装包」的 venv（0o700 补丁 + 引导 pip）
+│   ├── pip_local.py           # 给某个解释器跑 pip 时带上同一个补丁（pip --python 那条路不通）
 │   ├── vendor_wheels.py       # pip 装不上时的备用路径：下 wheel 直接解到 .venv-libs
 │   ├── docker-smoke.ps1       # 容器验收：build → 健康检查 → 真跑一条 → 抽 5 条黄金集
 │   └── check_container_files.py  # 没装 Docker 时的静态校验（COPY 路径/变量/健康检查子命令）
@@ -222,7 +234,8 @@ contentops-agent/
     ├── test_stage3.py         # 评测器自身：数据集校验、闸门开关、失败明细
     ├── test_stage4.py         # SQLite checkpointer：真起子进程，A 暂停 → B 恢复
     ├── test_stage5.py         # trace 落库幂等 + 页面跑完整个人工环（TestClient）
-    └── test_llm.py            # 模型层：请求体、重试策略、记账口径、峰谷价（不联网）
+    ├── test_llm.py            # 模型层：请求体、重试策略、记账口径、峰谷价（不联网）
+    └── test_packaging.py      # 打包合同：版本单一来源、控制台入口、依赖清单与 requirements 不漂
 ```
 
 ---
@@ -294,8 +307,8 @@ powershell -ExecutionPolicy Bypass -File scripts\docker-smoke.ps1
 |---|---|---|---|
 | 0 地基 | 1 | git / 依赖 / 仓库 / README / CI | ✅ 已推到 GitHub，Actions 跑 pytest |
 | 1 最小闭环 | 5 | 三节点 + 检索 + mock 模型 | ✅ 命令行跑通、有 commit |
-| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，测试全绿（当前 44 条） |
-| 3 工程化 | 5 | 评测集 + SQLite checkpointer + trace 落库与页面 + Docker + 打包 | 🟡 评测出数（30/30）✅、checkpointer 跨进程 ✅、trace 落库 + 页面 ✅、Docker 文件与验收脚本 ✅（本机待装 WSL2）；打包未做 |
+| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，测试全绿（当前 55 条） |
+| 3 工程化 | 5 | 评测集 + SQLite checkpointer + trace 落库与页面 + Docker + 打包 | 🟡 评测出数（30/30）✅、checkpointer 跨进程 ✅、trace 落库 + 页面 ✅、打包 `pip install -e .` ✅、Docker 文件与验收脚本 ✅（本机待装 WSL2） |
 | 4 讲述 | 3 | 录屏 + 讲稿 + 10 问 | 脱稿 3 分钟讲完 |
 | 5 投递 | 持续 | 简历回填 + 投递表 | 每周 ≥10 家 |
 
@@ -309,9 +322,71 @@ powershell -ExecutionPolicy Bypass -File scripts\docker-smoke.ps1
 
 | 现象 | 真实原因 | 解法 |
 |---|---|---|
-| `pip install` 报 `PermissionError: ...whl` / `pytest` 报 `...pytest-of-<用户>` | Python 3.14 会把 `os.mkdir(mode=0o700)` 应用到目录 DACL，而 `tempfile.mkdtemp()` 默认就用 0o700；受限令牌因此进不去自己刚建的目录 | 两条路：把 0o700 改成 0o777 再调 pip（提交历史里的 `pipx.py`）；或者绕开 pip —— `python scripts/vendor_wheels.py fastapi==0.115.14 starlette==0.46.2 uvicorn==0.34.0 python-multipart` 直接把 wheel 解到 `.venv-libs`。测试里同理：不用 `tmp_path`，用 `tests/conftest.py` 的 `work` fixture |
+| `pip install` 报 `PermissionError: ...whl` / `pytest` 报 `...pytest-of-<用户>` | Python 3.14 会把 `os.mkdir(mode=0o700)` 应用到目录 DACL，而 `tempfile.mkdtemp()` 默认就用 0o700；受限令牌因此进不去自己刚建的目录 | 三条路，按推荐顺序：① `python scripts\venv_bootstrap.py .venv` 建一个带 `sitecustomize` 补丁的 venv（子进程也生效，见第九节）；② 给单个解释器跑 pip 时套 `scripts\pip_local.py`；③ 绕开 pip —— `python scripts/vendor_wheels.py fastapi==0.115.14 starlette==0.46.2 uvicorn==0.34.0 python-multipart` 直接把 wheel 解到 `.venv-libs`。测试里同理：不用 `tmp_path`，用 `tests/conftest.py` 的 `work` fixture |
 | `git push` 报 `error adding trust anchors from file: ...ca-bundle.crt` | MinGit 的 OpenSSL 打不开带中文的 CA 路径（工作区目录名里有中文） | 把 `ca-bundle.crt` 复制到纯 ASCII 目录（如 `%TEMP%`），`git -c http.sslCAInfo=<该路径> push` |
 | `git push` 报 `schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS` | 受限令牌下 schannel 拿不到凭据链 | `git -c http.sslBackend=openssl`（仓库里 `tools/gitconfig` 已默认这么配） |
 | `.ps1` 里的中文全变乱码、报「字符串缺少终止符」 | PowerShell 5.1 读**无 BOM** 的 UTF-8 脚本时按 GBK 解 | 脚本一律存成 UTF-8 **with BOM**；`scripts/check_container_files.py` 里有一条断言守着这个 |
 | `curl` / PowerShell 的 HTTPS 全挂 | schannel 凭证链损坏 | 出网一律走 Python `requests`；git 配 `http.sslBackend=openssl` |
+
+---
+
+## 九、安装与打包（阶段 3 · S3-05）
+
+`pyproject.toml` 只有六十来行，做四件事，每件都有理由：
+
+| 写的东西 | 为什么 |
+|---|---|
+| `[project.scripts] contentops = "contentops.cli:main"` | 装完多一个命令。返回码原样透出：`0`=已发布、`75`=停在人工审核 —— 脚本和 CI 才分得清「暂停」和「失败」 |
+| `package-dir = {"" = "src"}` + `packages.find` | 源码在 `src/contentops/`。不声明的话，`pip install -e .` 要么找不到包，要么顺手把 `tests/` 也当成包收进去 |
+| `version` 与 `contentops.__version__` | 版本还是两份（toml 读不到运行时的值，运行时读不到 toml），但 `tests/test_packaging.py` 会拦住这两处漂掉 |
+| `[test]` extra | pytest 不进运行依赖；镜像里不装测试框架 |
+
+装法（普通机器三行）：
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e ".[test]"
+contentops --help
+```
+
+**这台机器要多一步**（受限令牌 + 0o700 的坑，见第八节）：`ensurepip` 和 `setuptools` 的临时目录是
+0o700，建出来就连自己都写不进去，普通 `venv` / `pip` 都过不去。所以先用脚本把 venv 备好：
+
+```bat
+python scripts\venv_bootstrap.py .venv      :: 建 venv + 写 sitecustomize + 引导 pip
+.venv\Scripts\python.exe -m pip install -e ".[test]"
+.venv\Scripts\contentops.exe --version      :: contentops 0.4.0
+```
+
+实测（2026-11-19，Python 3.14.6 / pip 26.1.2）：
+
+| 验证 | 结果 |
+|---|---|
+| `pip install -e ".[test]"` | 50 个包；产出 `contentops_agent-0.4.0-0.editable-py3-none-any.whl` |
+| `contentops --version` / `contentops --help` | `contentops 0.4.0`；`run / resume / kb / llm-check / eval / serve` 六个子命令都在 |
+| `contentops run --topic "用 AI 做周报自动化" --auto approve --out .probe-out` | 退出码 **0**，发布稿落在 `.probe-out\用-AI-做周报自动化.md` |
+| `contentops run ... --pause` → `contentops resume ... --decision approve` | 退出码 **75 → 0**，换个进程照样放行 —— 装出来的命令和 `python -m contentops.cli` 是同一个 `main` |
+| `contentops eval --limit 3` | 3/3 通过（mock，不花 token） |
+| `.venv\Scripts\python -m pytest -q` | **55 passed**（44 → 55，多出来的 11 条就是打包合同） |
+
+`pip install` 现场解出来的版本：langgraph 1.2.22 / langchain-core 1.8.3 / pydantic 2.14.3 /
+fastapi 0.119.1 / starlette 0.47.3 / uvicorn 0.39.0 / pytest 9.2.0 —— 全在 `pyproject.toml` 的上限里。
+CI 也改成了 `pip install -e ".[test]"` + `pytest`（不再是 `requirements.txt` + `PYTHONPATH=src`），
+这样「pyproject 能不能装」在 Linux/py3.12 上每次 push 都验一遍，不用靠本机这一台机器。
+
+已知限制（写在卡上，不藏着）：
+
+- **目前只有可编辑安装能用**。知识库在 `docs/kb/`，`retriever.KB_DIR = <仓库>/docs/kb`；`pip install .`
+  出的 wheel 里没有 `docs/`，装上就检索不到东西。要发 PyPI 得把 kb 挪进包
+  （`contentops/data/kb` + `importlib.resources`），那是下一张卡。
+- **没发 PyPI**，也没做 `build` 产物校验（`twine check` / `python -m build`）：这一步要等上面那条限制解决，
+  先出个装得上但跑不起来的 wheel 没意义。
+
+打包这一段踩到的两个坑（都不是本仓库的 bug，但都会在演示当天挡路）：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `python -m venv .venv` 报 ensurepip exit 1；`pip install` 报 `...\*.whl.metadata: Permission denied` | 0o700 目录的 DACL 把自己锁在外面（见第八节） | `scripts\venv_bootstrap.py`：`--without-pip` 兜底建解释器 → 写 `sitecustomize.py` → 带补丁跑 ensurepip |
+| `pip --python .venv\Scripts\python.exe install ...` 一样失败 | pip 会为 `--python` 重起子进程，命令行里打的 `os.mkdir` 补丁带不过去；setuptools 又把构建后端放进**另一个**子进程 | 补丁必须放 venv 的 `sitecustomize.py` —— 每个解释器启动都会导入它，子进程也逃不掉 |
 
