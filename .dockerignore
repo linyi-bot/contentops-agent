@@ -1,0 +1,21 @@
+# 构建上下文只留运行需要的东西。
+# .probe 里是调试脚本和抓下来的第三方文档（几十 MB），reports/outputs 是产物，
+# 它们进上下文只会让 build 变慢，不会让镜像变好用。
+
+.git
+.github
+.venv*
+.piptmp*
+.probe
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+reports/
+outputs/
+.contentops/
+data/
+tests/
+docs/看板.md
+docs/讲述材料.md
+*.log

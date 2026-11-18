@@ -1,0 +1,40 @@
+# 单机部署：`docker compose up --build` 就能出一条带引用的稿子。
+#
+# 不写 `version:` —— compose v2 已经不认这个字段，写了只会多一行 warning。
+# 变量用 `${VAR:-默认值}` 引用：compose 会自动读同目录的 .env，
+# 没有 .env 也不会报错，回落 mock（clone 下来零配置能跑，这是硬要求）。
+
+services:
+  contentops:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: contentops-agent:0.4
+
+    # init 让 PID 1 是个真正的 init：Ctrl+C / docker stop 能把信号传到 python，
+    # 否则超时会硬等 10 秒再 SIGKILL。
+    init: true
+
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-flash}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_THINKING: ${LLM_THINKING:-off}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      RETRIEVAL_MIN_SCORE: ${RETRIEVAL_MIN_SCORE:-0.09}
+
+    volumes:
+      # 产物出容器：跑完在宿主机上直接能看到 md / 评测报告
+      - ./outputs:/app/outputs
+      - ./reports:/app/reports
+      # checkpointer 落盘：容器重启后还能 resume 停在人工审核的会话
+      - ./data:/app/.contentops
+
+    command:
+      - run
+      - --topic
+      - 用 AI 做周报自动化
+      - --auto
+      - approve
+      - --out
+      - /app/outputs

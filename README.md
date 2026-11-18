@@ -3,7 +3,7 @@
 [![CI](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1f6feb)
-![Tests](https://img.shields.io/badge/tests-20%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-34%20passed-brightgreen)
 
 > 内容运营多智能体工作台 · LangGraph 编排 · 可评测、可观测、可复现
 
@@ -24,10 +24,10 @@ AI Agent 岗位的 JD 里反复出现这 7 个词，本项目一个不落地覆�
 | 编排（Orchestration） | LangGraph `StateGraph`，六节点 + 两条条件边（核查回写、人工打回） | ✅ 已完成 |
 | 工具调用（Tool Use） | 检索工具已按 schema 接入；抓取 / 发布工具 | 检索 ✅，其余阶段 3 |
 | RAG 检索增强 | 本地知识库 → 按二级标题分块 → BM25 式打分（单字 + 二元组）→ 拼上下文 | ✅ 已完成 |
-| 评测（Eval） | 30 条黄金集，5 个指标出报告，失败样本逐条留原因 | ✅ 已完成（mock 基线） |
-| 可观测（Observability） | 自建 trace：每节点耗时 + 一句人话 | ✅ 已完成 |
+| 评测（Eval） | 30 条黄金集，5 个指标出报告，失败样本逐条留原因 | ✅ 已完成（mock 基线；真模型待 key 重跑） |
+| 可观测（Observability） | 自建 trace：每节点耗时 + 一句人话 + 该版烧了多少 token | ✅ 已完成 |
 | 人工中断（Human-in-the-loop） | `interrupt()` 真暂停 + SQLite checkpointer：进程退出后换一个进程 `resume` 也能接着发布 | ✅ 已完成 |
-| 部署（Deploy） | Docker 单机 + 公网隧道 | 阶段 3 待做 |
+| 部署（Deploy） | Docker 单机 + compose + 健康检查 | 🟡 镜像文件就绪，本机 WSL2 未启用（一键脚本见第六节） |
 
 ---
 
@@ -110,9 +110,22 @@ python -m contentops.cli eval --dataset evals\golden --out reports
 默认用内存 checkpointer（clone 下来零配置能跑）；加上 `--db` 就换成 SQLite checkpointer ——
 状态落盘，**进程退出了也能换一个进程接着发**，`resume --decision reject` 打回后会在新进程里重写一版、再次停在审核。
 
-**用真实模型**：把 `.env.example` 复制成 `.env`，填 `DEEPSEEK_API_KEY`，
-然后 `set LLM_PROVIDER=deepseek` 再运行。没填 key 时自动回落到 mock，
+**用真实模型**：把 `.env.example` 复制成 `.env`，填 `DEEPSEEK_API_KEY` 和 `LLM_PROVIDER=deepseek`，
+然后先跑 `scripts\dev.cmd llm-check` 验通路（只花几十个 token），再跑正式流程。没填 key 时自动回落到 mock，
 保证「clone 下来就能跑」——这是阶段 0 的验收线之一。
+
+接 DeepSeek 时踩到 / 查到的三件事，都是会直接报错或直接多花钱的：
+
+| 坑 | 表现 | 本项目怎么处理 |
+|---|---|---|
+| 模型 ID 是枚举 | 写 `deepseek-chat` 直接 400 | 官方现在只认 `deepseek-flash` / `deepseek-v4-pro`，默认值已改；`llm-check` 会把当前模型和 base_url 打出来 |
+| 思考模式默认开 | 同一段草稿，输出 token 翻几倍 | 默认 `LLM_THINKING=off`（请求体里 `thinking.type=disabled`）；要开填 `on`，可选 `LLM_REASONING_EFFORT` |
+| 价格分时段 | 拿一个固定单价算成本，高峰时段会少算一半 | 按北京时间工作日 9-12 / 14-18 取高峰价，其余半价；也可用 `LLM_PRICE_IN_HIT` / `LLM_PRICE_IN_MISS` / `LLM_PRICE_OUT` 覆盖 |
+
+成本口径不写一个「总 token」了事：分别记 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` /
+`completion_tokens` —— 缓存命中的输入单价只有未命中的 1/50，混着算能把成本算高一个数量级。
+每跑完一条，CLI 末尾会打「几次调用 / 多少 token / 估算多少钱」；评测报告里单独有「成本」一节。
+调用失败也分得清：401/400 直接抛 `LLMError` 不重试，429/5xx/超时才退避重试（默认 2 次）。
 
 ---
 
@@ -122,6 +135,9 @@ python -m contentops.cli eval --dataset evals\golden --out reports
 contentops-agent/
 ├── README.md
 ├── requirements.txt
+├── Dockerfile                 # 单机镜像：非 root + HEALTHCHECK，不碰模型也能自检
+├── docker-compose.yml         # 一条命令起容器；变量走 .env，没有就回落 mock
+├── .dockerignore              # 把 .git / .probe / 产物挡在构建上下文外
 ├── .env.example
 ├── .gitignore
 ├── .github/workflows/ci.yml   # push 即跑 pytest
@@ -134,21 +150,24 @@ contentops-agent/
 │   ├── 讲述材料.md             # 3 分钟讲稿 + 录屏分镜 + 十个必问题
 │   └── 简历回填模板.md
 ├── scripts/
-│   └── dev.cmd                # 设好 PYTHONPATH 再跑，避免环境污染
+│   ├── dev.cmd                # 设好 PYTHONPATH 再跑，避免环境污染
+│   ├── docker-smoke.ps1       # 容器验收：build → 健康检查 → 真跑一条 → 抽 5 条黄金集
+│   └── check_container_files.py  # 没装 Docker 时的静态校验（COPY 路径/变量/健康检查子命令）
 ├── src/contentops/
 │   ├── state.py               # 图的状态定义（含断言 Claim 与审核包 ReviewPacket）
-│   ├── llm.py                 # 模型层：mock / deepseek 统一接口
+│   ├── llm.py                 # 模型层：mock / DeepSeek 统一接口 + 重试 + token/成本记账
 │   ├── retriever.py           # 知识库分块、单字 + 二元组切分、BM25 式打分
 │   ├── nodes.py               # 五个节点：检索 / 起草 / 核查 / 审核 / 发布
 │   ├── graph.py               # 图的组装 + 两条条件边 + 会话（checkpointer）工具
 │   ├── checkpoint.py          # SQLite checkpointer：状态落盘，跨进程恢复
-│   ├── eval.py                # 评测器：跑黄金集、算指标、留失败明细
-│   └── cli.py                 # 命令行入口（run / resume / kb / eval，含人工审核交互）
+│   ├── eval.py                # 评测器：跑黄金集、算指标、留失败明细、记成本
+│   └── cli.py                 # 命令行入口（run / resume / kb / eval / llm-check）
 └── tests/
     ├── test_smoke.py          # 链路能不能跑通
     ├── test_stage2.py         # 核查规则 / 中断 / 打回额度
     ├── test_stage3.py         # 评测器自身：数据集校验、闸门开关、失败明细
-    └── test_stage4.py         # SQLite checkpointer：真起子进程，A 暂停 → B 恢复
+    ├── test_stage4.py         # SQLite checkpointer：真起子进程，A 暂停 → B 恢复
+    └── test_llm.py            # 模型层：请求体、重试策略、记账口径、峰谷价（不联网）
 ```
 
 ---
@@ -177,7 +196,34 @@ contentops-agent/
 
 ---
 
-## 六、路线图
+## 六、容器化（阶段 3）
+
+```bat
+:: 构建 + 跑一条（mock，不花 token）
+docker build -t contentops-agent:0.4 .
+docker run --rm contentops-agent:0.4 run --topic "用 AI 做周报自动化" --auto approve
+
+:: 或者 compose 起（自动读同目录 .env；没有 .env 就回落 mock）
+docker compose up --build
+
+:: 一条命令验收：build → 健康检查 → 真跑一条 → 抽 5 条黄金集
+powershell -ExecutionPolicy Bypass -File scripts\docker-smoke.ps1
+```
+
+镜像里只有三样东西：源码、知识库、评测集。`.git` / `.probe` / 产物目录都被 `.dockerignore` 挡在外面。
+容器以非 root 跑，`HEALTHCHECK` 故意不碰模型 —— 没有 key 也要能判断「镜像里的代码和知识库是活的」。
+产物通过 `./outputs:/app/outputs` 出容器；`.contentops` 挂到 `./data`，容器重启后还能 `resume` 停在审核的会话。
+
+> **本机现状（2026-11-19）**：这台机器没装 Docker，WSL2 功能也没启用（`LxssManager` 服务不存在）。
+> 两者都要管理员权限 + 重启一次，`tools\install-docker.cmd` 就是为这一步写的：自己提权 → 查虚拟化 →
+> 启用 WSL/虚拟机平台 → 装 WSL2 内核 → 装 Docker Desktop → 提示重启。
+> 想先看它要动什么：`powershell -File tools\install-docker.ps1 -DryRun`（只体检，不改系统）。
+> 在装好之前，`scripts\check_container_files.py` 会先做静态校验：COPY 的路径在不在、
+> compose 引用的变量在 `.env.example` 里有没有、HEALTHCHECK 调的子命令注册没注册。
+
+---
+
+## 七、路线图
 
 任务卡（现在做哪一张、卡在哪）看 [`docs/看板.md`](docs/看板.md)；这里只留总览。
 
@@ -185,14 +231,14 @@ contentops-agent/
 |---|---|---|---|
 | 0 地基 | 1 | git / 依赖 / 仓库 / README / CI | ✅ 已推到 GitHub，Actions 跑 pytest |
 | 1 最小闭环 | 5 | 三节点 + 检索 + mock 模型 | ✅ 命令行跑通、有 commit |
-| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，测试全绿（当前 23 条） |
-| 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | 🟡 评测已出数（30/30）✅、SQLite checkpointer 跨进程恢复 ✅；Docker / 打包未做 |
+| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，测试全绿（当前 34 条） |
+| 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | 🟡 评测出数（30/30）✅、checkpointer 跨进程 ✅、Docker 文件与验收脚本 ✅（本机待装 WSL2）；打包未做 |
 | 4 讲述 | 3 | 录屏 + 讲稿 + 10 问 | 脱稿 3 分钟讲完 |
 | 5 投递 | 持续 | 简历回填 + 投递表 | 每周 ≥10 家 |
 
 ---
 
-## 七、在受限环境里跑（可选）
+## 八、在受限环境里跑（可选）
 
 如果目标机器是「没有管理员权限 + 出网受限 + 系统 TLS 损坏」的那类环境，
 本项目刻意避开了三个依赖：不依赖 GPU、不依赖向量库、不依赖外部可观测平台。

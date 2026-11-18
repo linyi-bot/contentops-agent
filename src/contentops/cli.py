@@ -32,6 +32,7 @@ from .graph import (
     session,
     start,
 )
+from .llm import build_llm, describe, usage_snapshot
 from .retriever import Retriever
 from .state import ContentState
 
@@ -105,6 +106,27 @@ def _print_trace(state: ContentState) -> None:
         print(f"  {ev['node']:<10} {ev['ms']:>5} ms  {ev['note']}")
 
 
+def _print_usage() -> None:
+    """这一轮花了多少 token / 多少钱。mock 不调用模型，这行就不打。"""
+    u = usage_snapshot()
+    if not u.calls:
+        return
+    print(
+        f"\n【成本】{u.calls} 次调用　输入 {u.prompt_tokens} tokens"
+        f"（缓存命中 {u.cache_hit_tokens}）　输出 {u.completion_tokens} tokens"
+        f"　估算 ¥{u.cost_cny:.4f}"
+    )
+
+
+def _print_model() -> None:
+    d = describe()
+    if d["real"]:
+        thinking = "思考模式开" if d["thinking"] else "思考模式关"
+        print(f"模型：{d['label']}（{thinking}，{d['base_url']}）")
+    else:
+        print(f"模型：mock（{d.get('note', '未配 key')}）—— 不花 token，数字只用来验证链路")
+
+
 def _write_output(state: ContentState, out_dir: Path) -> Path:
     """把发布记录落成一篇 markdown —— 这一步有副作用，所以只放在 CLI 里。"""
     published = state.get("published") or {}
@@ -168,6 +190,7 @@ def _emit_result(state: ContentState, args: argparse.Namespace) -> int:
         print("\n【结束】人工打回且重写额度用尽，未发布 —— 这一版不算交付。")
 
     _print_trace(state)
+    _print_usage()
     if args.json:
         print("\n【raw state】")
         print(json.dumps(state, ensure_ascii=False, indent=2, default=str))
@@ -181,6 +204,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
         print(LINE)
         print(f"选题：{state.get('topic')}　会话：{tid}")
+        _print_model()
         print(LINE)
         _print_hits(state)
         _print_draft(state)
@@ -192,6 +216,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 return _emit_result(state, args)
             _print_packet(interrupt_payload(state))
             print(_pause_hint(tid, db))
+            _print_usage()
             return EXIT_PAUSED
 
         rounds = 0
@@ -231,6 +256,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
             print("\n【又停在审核】上一轮打回后已重写一版，还是等你答复。")
             _print_packet(interrupt_payload(state))
             print(_pause_hint(tid, db))
+            _print_usage()
             return EXIT_PAUSED
 
         return _emit_result(state, args)
@@ -243,6 +269,30 @@ def _cmd_kb(args: argparse.Namespace) -> int:
         for i, h in enumerate(r.search(args.query, top_k=args.top_k), 1):
             print(f"\n[{i}] {h['doc']} · {h['heading']}  score={h['score']:.3f}")
             print("   " + h["text"][:160].replace("\n", " "))
+    return 0
+
+
+def _cmd_llm_check(args: argparse.Namespace) -> int:
+    """花几个 token 验证 key / 模型名 / 网络 —— 接真模型时第一件事就是跑它。"""
+    d = describe()
+    _print_model()
+    print(f"  base_url：{d['base_url'] or '（mock，没有 base_url）'}")
+    if not d["real"]:
+        print("\n[!] 现在会走 mock：要接真模型，请在 .env 里设 LLM_PROVIDER=deepseek 并填 DEEPSEEK_API_KEY")
+        return 1
+
+    from .llm import LLMError
+
+    try:
+        llm = build_llm()
+        result = llm.ping()  # type: ignore[attr-defined]
+    except LLMError as exc:
+        print(f"\n[X] 调用失败：{exc}")
+        print("    401/403 → key 不对；400 → 模型名不在枚举里（现在只认 deepseek-flash / deepseek-v4-pro）")
+        return 2
+
+    print(f"\n[OK] 模型回了「{result['reply']}」，往返 {result['ms']} ms")
+    _print_usage()
     return 0
 
 
@@ -260,6 +310,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         cases = cases[: args.limit]
 
     print(f"数据集 {args.dataset}：{len(cases)} 条（相关度阈值 {effective_min_score()}）")
+    _print_model()
     report = E.evaluate(cases)
 
     for name, value in report["metrics"].items():
@@ -272,6 +323,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     if args.out:
         path = E.write_report(report, Path(args.out), label=args.label)
         print(f"\n已写出：{path}")
+    _print_usage()
     if args.json:
         print("\n【raw report】")
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
@@ -325,6 +377,9 @@ def main(argv: list[str] | None = None) -> int:
     pk.add_argument("--query", default="", help="检索词")
     pk.add_argument("--top-k", type=int, default=3)
     pk.set_defaults(func=_cmd_kb)
+
+    pl = sub.add_parser("llm-check", help="验证 DeepSeek 的 key / 模型名 / 网络（只花几个 token）")
+    pl.set_defaults(func=_cmd_llm_check)
 
     pe = sub.add_parser("eval", help="跑黄金集，出评测报告")
     pe.add_argument("--dataset", default=str(Path("evals") / "golden"), help="数据集目录或单个 jsonl")

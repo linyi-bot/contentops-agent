@@ -20,3 +20,10 @@ jobs:
 
       - name: Run tests
         run: PYTHONPATH=src pytest -q -p no:cacheprovider
+
+      # 容器化文件没有 docker 也能查：COPY 路径在不在、compose 变量有没有声明、
+      # 健康检查调的子命令注册没注册。真 build 要等装好 Docker，见看板 S3-07。
+      - name: Check container files
+        run: |
+          pip install pyyaml
+          python scripts/check_container_files.py

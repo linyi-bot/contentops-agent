@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from . import graph as G
+from .llm import describe, reset_usage, usage_snapshot
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = ROOT / "evals" / "golden"
@@ -191,6 +192,7 @@ def _pct(num: int, den: int) -> float:
 def evaluate(cases: list[Case]) -> dict[str, Any]:
     from .nodes import min_score as effective_min_score
 
+    reset_usage()  # 报告里的成本是「这一轮」的，不是这个进程累计的
     results = [run_case(c) for c in cases]
 
     answerable = [r for r in results if not r.case.should_refuse]
@@ -220,7 +222,8 @@ def evaluate(cases: list[Case]) -> dict[str, Any]:
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "reviewer": REVIEWER,
-        "llm": os.getenv("LLM_PROVIDER", "mock") or "mock",
+        "llm": describe()["label"],
+        "usage": usage_snapshot().as_dict(),
         "min_score": effective_min_score(),
         "python": platform.python_version(),
         "counts": {
@@ -286,9 +289,25 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"平均 {report['latency_ms']['avg']} ms　P95 {report['latency_ms']['p95']} ms　"
         f"草稿平均 {report['draft_chars_avg']} 字",
         "",
-        "## 二、失败明细",
-        "",
     ]
+
+    usage = report.get("usage") or {}
+    section = 2
+    cn = {2: "二", 3: "三", 4: "四"}
+    if usage.get("calls"):
+        lines += [
+            f"## 二、成本（{report['llm']}）",
+            "",
+            f"- 模型调用 **{usage['calls']}** 次，失败 {usage.get('errors', 0)} 次",
+            f"- 输入 {usage['prompt_tokens']} tokens（其中缓存命中 {usage['cache_hit_tokens']}）"
+            f"　输出 {usage['completion_tokens']} tokens",
+            f"- 估算花费 **¥{usage['cost_cny']:.4f}**，平均每条样本 "
+            f"¥{usage['cost_cny'] / max(counts['cases'], 1):.4f}",
+            "",
+        ]
+        section = 3
+
+    lines += [f"## {cn[section]}、失败明细", ""]
 
     failures = [r for r in results if not r.ok]
     if not failures:
@@ -307,10 +326,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         ]
 
     lines += [
-        "## 三、口径（读这张表前先看这三条）",
+        f"## {cn[section + 1]}、口径（读这张表前先看这三条）",
         "",
         "1. **事实一致性是下界**：它只判「引用落地 + 引到期望小节」，语义是否真支持由人工抽检，"
-        "mock 阶段判不了，这里不假装。",
+        "机器判不了，这里不假装。",
         "2. **审核员是代理**：`strict` 只是「断言全过才放行」。换真人、换策略，数字就不可比。",
         "3. **阈值是在这 30 条上定的**：相关度阈值由「应答题最低分」与「拒答题最高分」之间取中，"
         "属于在测试集上调参；样本扩到 100 条后要重测，别把这个数当泛化结论。",

@@ -17,7 +17,7 @@ import re
 import time
 from datetime import datetime
 
-from .llm import LLM, build_llm
+from .llm import LLM, build_llm, usage_snapshot
 from .retriever import Retriever
 from .state import Claim, ContentState, Hit, ReviewPacket, TraceEvent
 
@@ -104,9 +104,17 @@ def draft_node(state: ContentState) -> dict:
             f"- {u}" for u in unchecked[:5]
         )
 
+    before = usage_snapshot()
     try:
         draft = llm.complete(DRAFT_SYSTEM, user)
+        after = usage_snapshot()
+        spent = (after.prompt_tokens - before.prompt_tokens) + (
+            after.completion_tokens - before.completion_tokens
+        )
         note = f"第 {revision} 版，模型 {llm.name} 生成 {len(draft)} 字"
+        if spent:
+            # 真模型才有的信息：这一版烧了多少 token。mock 不打这一行，免得 trace 里全是 0。
+            note += f"（{spent} tokens）"
     except Exception as exc:  # 网络/额度问题不应该让整条流水线死掉
         draft = f"（生成失败：{type(exc).__name__}: {exc}）\n资料共 {len(hits)} 条，已保留在 trace 中。"
         note = f"第 {revision} 版，模型调用失败已降级：{type(exc).__name__}"
