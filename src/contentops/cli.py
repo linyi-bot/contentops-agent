@@ -4,6 +4,14 @@
     python -m contentops.cli run --topic "..." --auto approve          # 不给 stdin 也能跑完
     python -m contentops.cli run --topic "..." --auto approve --out outputs
 
+跨进程恢复（阶段 3 的 SQLite checkpointer）：
+
+    :: 进程 A：停在审核就退出，返回码 75
+    python -m contentops.cli run --topic "..." --db .contentops\\state.sqlite --thread-id demo --pause
+
+    :: 进程 B：换一个终端/第二天，接着发布
+    python -m contentops.cli resume --thread-id demo --db .contentops\\state.sqlite --decision approve --out outputs
+
 刻意不做 Web UI：命令行把「检索 → 草稿 → 核查 → 人工审核 → 发布」全流程打印出来，
 录屏讲项目时一屏就能讲清楚，比一个要装一堆前端依赖的页面更稳。
 """
@@ -17,16 +25,21 @@ import sys
 from pathlib import Path
 
 from .graph import (
+    config_for,
     interrupt_payload,
     is_interrupted,
-    new_session,
     resume,
+    session,
     start,
 )
 from .retriever import Retriever
 from .state import ContentState
 
 LINE = "=" * 66
+
+#: 「不是失败，是先停下等答复」。放在返回码里，脚本/测试才分得清
+#: 75 = EX_TEMPFAIL（沿用 sysexits.h 的约定），比 0/1 更能表达「还可以接着跑」。
+EXIT_PAUSED = 75
 
 
 def _print_hits(state: ContentState) -> None:
@@ -118,29 +131,31 @@ def _write_output(state: ContentState, out_dir: Path) -> Path:
     return path
 
 
-def _cmd_run(args: argparse.Namespace) -> int:
-    app, tid = new_session()
-    state = start(app, args.topic, tid)
+def _db_arg(value: str) -> str:
+    """`--db` 优先，其次 `CONTENTOPS_DB`；返回空串表示内存模式。"""
+    return value or os.environ.get("CONTENTOPS_DB", "").strip()
 
-    print(LINE)
-    print(f"选题：{state.get('topic')}　会话：{tid}")
-    print(LINE)
-    _print_hits(state)
-    _print_draft(state)
-    _print_factcheck(state)
 
-    rounds = 0
-    while is_interrupted(state) and rounds < 6:
-        packet = interrupt_payload(state)
-        _print_packet(packet)
-        state = resume(app, _ask(packet, args.auto), tid)
-        rounds += 1
+def _pause_hint(tid: str, db: str) -> str:
+    if not db:
+        return (
+            f"\n【已暂停】会话 {tid} 已停在人工审核（内存模式）\n"
+            "  注意：没给 --db，状态只在内存里，这个进程一退就没了。\n"
+            "  想跨进程接着发，加：--db .contentops/checkpoints.sqlite"
+        )
+    return "\n".join(
+        [
+            f"\n【已暂停】会话 {tid} 的状态已落盘，这个进程现在就可以退出",
+            f"  状态库：{Path(db).resolve()}",
+            "  换一个进程接着发：",
+            f'    python -m contentops.cli resume --thread-id {tid} --db "{db}" --decision approve',
+            '  （--decision reject --note "哪里不行" 则打回重写一版）',
+        ]
+    )
 
-    if is_interrupted(state):
-        print("\n[!] 连打回 6 轮仍未收束，主动停下（检查路由或模型输出）")
-        _print_trace(state)
-        return 3
 
+def _emit_result(state: ContentState, args: argparse.Namespace) -> int:
+    """打印终局：发布 / 未发布。run 和 resume 共用。"""
     if state.get("published"):
         pub = state["published"]
         print(f"\n【发布】{pub['title']}　闸门：{pub['gate']}")
@@ -157,6 +172,68 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print("\n【raw state】")
         print(json.dumps(state, ensure_ascii=False, indent=2, default=str))
     return 0
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    db = _db_arg(args.db)
+    with session(args.thread_id or None, db=db or None) as (app, tid):
+        state = start(app, args.topic, tid)
+
+        print(LINE)
+        print(f"选题：{state.get('topic')}　会话：{tid}")
+        print(LINE)
+        _print_hits(state)
+        _print_draft(state)
+        _print_factcheck(state)
+
+        # --pause：跑到人工审核就停，不读 stdin —— 这是「进程 A」的用法
+        if args.pause:
+            if not is_interrupted(state):
+                return _emit_result(state, args)
+            _print_packet(interrupt_payload(state))
+            print(_pause_hint(tid, db))
+            return EXIT_PAUSED
+
+        rounds = 0
+        while is_interrupted(state) and rounds < 6:
+            packet = interrupt_payload(state)
+            _print_packet(packet)
+            state = resume(app, _ask(packet, args.auto), tid)
+            rounds += 1
+
+        if is_interrupted(state):
+            print("\n[!] 连打回 6 轮仍未收束，主动停下（检查路由或模型输出）")
+            _print_trace(state)
+            return 3
+
+        return _emit_result(state, args)
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    """恢复一个停在人工审核的会话。可以跟暂停时不在同一个进程。"""
+    db = _db_arg(args.db)
+    with session(args.thread_id, db=db or None) as (app, tid):
+        snap = app.get_state(config_for(tid))
+        if not snap.values:
+            print(f"[X] 找不到会话 {tid}：--db={db or '（没给，内存模式）'}")
+            print("    --thread-id 和 --db 必须跟暂停那次一致；跨进程恢复不能省 --db。")
+            return 2
+        if not snap.interrupts:
+            print(f"[!] 会话 {tid} 没有待审的草稿（已经跑完，或从没暂停过）。")
+            return 2
+
+        _print_packet(snap.interrupts[0].value)
+        print(f"\n【恢复】会话 {tid} ← {args.decision}（附言：{args.note or '无'}）")
+
+        state = resume(app, {"decision": args.decision, "note": args.note}, tid)
+
+        if is_interrupted(state):
+            print("\n【又停在审核】上一轮打回后已重写一版，还是等你答复。")
+            _print_packet(interrupt_payload(state))
+            print(_pause_hint(tid, db))
+            return EXIT_PAUSED
+
+        return _emit_result(state, args)
 
 
 def _cmd_kb(args: argparse.Namespace) -> int:
@@ -217,7 +294,32 @@ def main(argv: list[str] | None = None) -> int:
     )
     pr.add_argument("--out", default="", help="把发布记录写成 markdown 到该目录")
     pr.add_argument("--json", action="store_true", help="打印完整 state")
+    pr.add_argument("--thread-id", default="", help="会话 id（默认随机；跨进程恢复时两边要一致）")
+    pr.add_argument(
+        "--db",
+        default="",
+        help="checkpoint 落盘的 sqlite 路径；给了才能跨进程恢复（默认内存）",
+    )
+    pr.add_argument(
+        "--pause",
+        action="store_true",
+        help="跑到人工审核就停，不读 stdin，返回码 75（给「进程 A 暂停 → 进程 B resume」用）",
+    )
     pr.set_defaults(func=_cmd_run)
+
+    pres = sub.add_parser("resume", help="恢复一个停在人工审核的会话（可跨进程）")
+    pres.add_argument("--thread-id", required=True, help="暂停时的会话 id")
+    pres.add_argument("--db", default="", help="暂停时用的 checkpoint sqlite 路径")
+    pres.add_argument(
+        "--decision",
+        choices=["approve", "reject"],
+        default="approve",
+        help="放行 / 打回（打回后可再 resume 一次接着审）",
+    )
+    pres.add_argument("--note", default="", help="打回附言")
+    pres.add_argument("--out", default="", help="放行后把发布记录写到该目录")
+    pres.add_argument("--json", action="store_true", help="打印完整 state")
+    pres.set_defaults(func=_cmd_resume)
 
     pk = sub.add_parser("kb", help="查看/检索知识库")
     pk.add_argument("--query", default="", help="检索词")

@@ -3,7 +3,7 @@
 
 # 依赖（本机是 --target 安装到 .venv-libs，不提交）
 .venv-libs/
-.piptmp/
+.piptmp*/
 venv/
 .venv/
 
@@ -18,6 +18,8 @@ tests/_tmp/
 data/
 outputs/
 *.log
+# checkpoint 落盘（--db .contentops/...）
+.contentops/
 
 # 本地探测脚本（不进仓库）
 .probe/

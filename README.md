@@ -26,7 +26,7 @@ AI Agent 岗位的 JD 里反复出现这 7 个词，本项目一个不落地覆�
 | RAG 检索增强 | 本地知识库 → 按二级标题分块 → BM25 式打分（单字 + 二元组）→ 拼上下文 | ✅ 已完成 |
 | 评测（Eval） | 30 条黄金集，5 个指标出报告，失败样本逐条留原因 | ✅ 已完成（mock 基线） |
 | 可观测（Observability） | 自建 trace：每节点耗时 + 一句人话 | ✅ 已完成 |
-| 人工中断（Human-in-the-loop） | `interrupt()` 真暂停 + checkpointer 可恢复 | ✅ 已完成 |
+| 人工中断（Human-in-the-loop） | `interrupt()` 真暂停 + SQLite checkpointer：进程退出后换一个进程 `resume` 也能接着发布 | ✅ 已完成 |
 | 部署（Deploy） | Docker 单机 + 公网隧道 | 阶段 3 待做 |
 
 ---
@@ -92,18 +92,23 @@ python -m contentops.cli run --topic "用 AI 做周报自动化"
 :: 4) 免交互跑完，并把发布记录落成 markdown（CI / 录屏用这个）
 python -m contentops.cli run --topic "用 AI 做周报自动化" --auto approve --out outputs
 
-:: 5) 测试
+:: 5) 跨进程恢复：A 跑到审核就退出（返回码 75），B 第二天接着发布
+python -m contentops.cli run --topic "用 AI 做周报自动化" --db .contentops\state.sqlite --thread-id demo --pause
+python -m contentops.cli resume --thread-id demo --db .contentops\state.sqlite --decision approve --out outputs
+
+:: 6) 测试
 python -m pytest -q
 
-:: 6) 评测：30 条黄金集 → 汇总表 + 失败明细（报告写进 reports\）
+:: 7) 评测：30 条黄金集 → 汇总表 + 失败明细（报告写进 reports\）
 python -m contentops.cli eval --dataset evals\golden --out reports
 ```
 
 `scripts\dev.cmd` 只是把第 2 步和启动命令包了一下（Windows 专用，省得每次设环境变量）。
 
 **人工审核长什么样**：图停在 `review` 节点，把审核包（选题、第几版、草稿、每条断言的核查结论）打印出来，
-然后等一个答复。答复是 `Command(resume=...)` 喂回图的，不是命令行参数 ——
-所以「今天先不发，明天接着发」是可行的（阶段 3 换成 SQLite checkpointer 就能跨进程）。
+然后等一个答复。答复是 `Command(resume=...)` 喂回图的，不是命令行参数。
+默认用内存 checkpointer（clone 下来零配置能跑）；加上 `--db` 就换成 SQLite checkpointer ——
+状态落盘，**进程退出了也能换一个进程接着发**，`resume --decision reject` 打回后会在新进程里重写一版、再次停在审核。
 
 **用真实模型**：把 `.env.example` 复制成 `.env`，填 `DEEPSEEK_API_KEY`，
 然后 `set LLM_PROVIDER=deepseek` 再运行。没填 key 时自动回落到 mock，
@@ -136,12 +141,14 @@ contentops-agent/
 │   ├── retriever.py           # 知识库分块、单字 + 二元组切分、BM25 式打分
 │   ├── nodes.py               # 五个节点：检索 / 起草 / 核查 / 审核 / 发布
 │   ├── graph.py               # 图的组装 + 两条条件边 + 会话（checkpointer）工具
+│   ├── checkpoint.py          # SQLite checkpointer：状态落盘，跨进程恢复
 │   ├── eval.py                # 评测器：跑黄金集、算指标、留失败明细
-│   └── cli.py                 # 命令行入口（run / kb / eval，含人工审核交互）
+│   └── cli.py                 # 命令行入口（run / resume / kb / eval，含人工审核交互）
 └── tests/
     ├── test_smoke.py          # 链路能不能跑通
     ├── test_stage2.py         # 核查规则 / 中断 / 打回额度
-    └── test_stage3.py         # 评测器自身：数据集校验、闸门开关、失败明细
+    ├── test_stage3.py         # 评测器自身：数据集校验、闸门开关、失败明细
+    └── test_stage4.py         # SQLite checkpointer：真起子进程，A 暂停 → B 恢复
 ```
 
 ---
@@ -178,8 +185,8 @@ contentops-agent/
 |---|---|---|---|
 | 0 地基 | 1 | git / 依赖 / 仓库 / README / CI | ✅ 已推到 GitHub，Actions 跑 pytest |
 | 1 最小闭环 | 5 | 三节点 + 检索 + mock 模型 | ✅ 命令行跑通、有 commit |
-| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，12 条测试全绿 |
-| 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | 🟡 评测已出数（30/30）；checkpointer / Docker / 打包未做 |
+| 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 带引用稿子产出，测试全绿（当前 23 条） |
+| 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | 🟡 评测已出数（30/30）✅、SQLite checkpointer 跨进程恢复 ✅；Docker / 打包未做 |
 | 4 讲述 | 3 | 录屏 + 讲稿 + 10 问 | 脱稿 3 分钟讲完 |
 | 5 投递 | 持续 | 简历回填 + 投递表 | 每周 ≥10 家 |
 

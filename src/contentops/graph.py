@@ -16,12 +16,15 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
+from .checkpoint import sqlite_saver
 from .nodes import draft_node, factcheck_node, publish_node, retrieve_node, review_node
 from .state import ContentState
 
@@ -93,10 +96,29 @@ def interrupt_payload(state: ContentState) -> Any:
     return interrupts[0].value if interrupts else None
 
 
+def new_thread_id() -> str:
+    return f"session-{uuid.uuid4().hex[:8]}"
+
+
 def new_session() -> tuple[Any, str]:
-    """建一张带内存 checkpointer 的图，返回 (app, thread_id)。"""
+    """建一张带**内存** checkpointer 的图，返回 (app, thread_id)。"""
     app = build_graph(InMemorySaver())
-    return app, f"session-{uuid.uuid4().hex[:8]}"
+    return app, new_thread_id()
+
+
+@contextmanager
+def session(thread_id: str | None = None, *, db: str | None = None) -> Iterator[tuple[Any, str]]:
+    """开一次会话。
+
+    `db` 为空 → 内存 saver（进程内可恢复，进程退出就没）。
+    `db` 给了 → SQLite saver，状态落盘，换一个进程也能接着跑。
+    """
+    tid = thread_id or new_thread_id()
+    if db:
+        with sqlite_saver(db) as saver:
+            yield build_graph(saver), tid
+    else:
+        yield build_graph(InMemorySaver()), tid
 
 
 def start(app: Any, topic: str, thread_id: str) -> ContentState:
