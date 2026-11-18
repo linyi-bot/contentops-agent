@@ -45,6 +45,9 @@ def route_after_review(state: ContentState) -> str:
     """人工答复之后去哪。"""
     if state.get("review_decision") == "approve":
         return "publish"
+    if not state.get("hits"):
+        # 没有资料可引，再写一版也只能编 —— 直接收工，别把额度耗在注定做不成的事上
+        return "end"
     if state.get("revision", 0) >= MAX_REVISION:
         return "end"
     return "draft"

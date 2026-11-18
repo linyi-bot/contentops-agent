@@ -19,12 +19,23 @@ from .state import Hit
 
 KB_DIR = Path(__file__).resolve().parents[2] / "docs" / "kb"
 
-_TOKEN = re.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9_]+")
+_CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
+_ASCII = re.compile(r"[a-zA-Z0-9_]+")
 
 
 def tokenize(text: str) -> list[str]:
-    """中文按字、英文按词切。够用且无需分词词典。"""
-    return [t.lower() for t in _TOKEN.findall(text)]
+    """中文按「单字 + 二元组」切，英文/数字按词切。
+
+    为什么加二元组：只按单字切时，「明天天气」和「周报自动化」在打分器眼里
+    都是「几个常用汉字」，拒答题能撞出一堆低分命中（评测里表现为过度回答）。
+    「周报」「核查」「中断」这类二元组带的信息量远大于单字，且不需要装分词词典。
+    """
+    tokens: list[str] = []
+    for run in _CJK_RUN.findall(text):
+        tokens.extend(run)
+        tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
+    tokens.extend(m.group(0).lower() for m in _ASCII.finditer(text))
+    return tokens
 
 
 def split_chunks(markdown: str) -> list[tuple[str, str]]:

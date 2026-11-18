@@ -24,7 +24,10 @@ from typing import Protocol
 import httpx
 
 # 检索上下文里的资料头：`[2] 出自《内容运营基础》· 事实核查`
-_DOC_HEADER = re.compile(r"^\[(\d+)\] 出自《([^》]*)》(?:·\s*(.*))?$")
+# 用 MULTILINE 在整个 user 串里找，而不是按空行分块后只看第一行 ——
+# 第一块的开头是「资料：」，按块解析会把第 1 条资料整条丢掉（mock 会因此
+# 永远引用第 2、3 条，评测里表现为「引用命中率虚高、事实一致性虚低」）。
+_DOC_HEADER = re.compile(r"^\[(\d+)\] 出自《([^》]*)》(?:·\s*(.*))?$", re.MULTILINE)
 _LEAD_NOISE = re.compile(r"^[\s\-*>#|]+")
 
 
@@ -46,16 +49,17 @@ def _first_sentence(text: str, limit: int = 46) -> str:
 
 
 def _parse_context(user: str) -> list[tuple[int, str, str, str]]:
-    """把 `_format_context()` 产出的资料块解析回（编号, 文档, 小节, 正文）。"""
+    """把 `_format_context()` 产出的资料块解析回（编号, 文档, 小节, 正文）。
+
+    按「资料头」在全串里定位，两两之间就是正文 —— 这样第一条资料不会被
+    前面的「资料：」那一行挡住。
+    """
+    matches = list(_DOC_HEADER.finditer(user))
     docs: list[tuple[int, str, str, str]] = []
-    for block in user.split("\n\n"):
-        lines = block.splitlines()
-        if not lines:
-            continue
-        m = _DOC_HEADER.match(lines[0].strip())
-        if not m:
-            continue
-        body = "\n".join(lines[1:]).strip()
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(user)
+        body = user[start:end].strip()
         if not body:
             continue
         docs.append((int(m.group(1)), m.group(2), (m.group(3) or "").strip(), body))

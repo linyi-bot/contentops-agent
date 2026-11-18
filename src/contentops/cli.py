@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -168,6 +169,40 @@ def _cmd_kb(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_eval(args: argparse.Namespace) -> int:
+    from . import eval as E
+    from .nodes import min_score as effective_min_score
+
+    # 阈值在跑样本之前落地：nodes.min_score() 每次调用都会重读环境变量，
+    # 所以「一条命令跑基线、一条命令跑加闸门」是可控的，不需要改代码。
+    if args.min_score is not None:
+        os.environ["RETRIEVAL_MIN_SCORE"] = str(args.min_score)
+
+    cases = E.load_cases(Path(args.dataset))
+    if args.limit:
+        cases = cases[: args.limit]
+
+    print(f"数据集 {args.dataset}：{len(cases)} 条（相关度阈值 {effective_min_score()}）")
+    report = E.evaluate(cases)
+
+    for name, value in report["metrics"].items():
+        print(f"  {name:<12} {value:>6}%")
+    print(
+        f"  通过 {report['counts']['passed']}/{report['counts']['cases']}"
+        f"　平均 {report['latency_ms']['avg']} ms　P95 {report['latency_ms']['p95']} ms"
+    )
+
+    if args.out:
+        path = E.write_report(report, Path(args.out), label=args.label)
+        print(f"\n已写出：{path}")
+    if args.json:
+        print("\n【raw report】")
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+
+    # 有失败样本就返回非零：CI 里能把「指标掉了」当红灯，而不是只打印一行看着好看的字
+    return 0 if report["counts"]["passed"] == report["counts"]["cases"] else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="contentops", description="ContentOps Agent")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -188,6 +223,20 @@ def main(argv: list[str] | None = None) -> int:
     pk.add_argument("--query", default="", help="检索词")
     pk.add_argument("--top-k", type=int, default=3)
     pk.set_defaults(func=_cmd_kb)
+
+    pe = sub.add_parser("eval", help="跑黄金集，出评测报告")
+    pe.add_argument("--dataset", default=str(Path("evals") / "golden"), help="数据集目录或单个 jsonl")
+    pe.add_argument("--out", default="", help="报告输出目录（留空只打印）")
+    pe.add_argument(
+        "--min-score",
+        type=float,
+        default=None,
+        help="相关度阈值；0 = 关掉闸门跑基线对照（默认读 RETRIEVAL_MIN_SCORE，再不行用 0.13）",
+    )
+    pe.add_argument("--limit", type=int, default=0, help="只跑前 N 条（调试用）")
+    pe.add_argument("--label", default="", help="报告文件名后缀，如 v0.3-gated（留空按阈值自动取）")
+    pe.add_argument("--json", action="store_true", help="打印完整报告 JSON")
+    pe.set_defaults(func=_cmd_eval)
 
     args = p.parse_args(argv)
     return args.func(args)

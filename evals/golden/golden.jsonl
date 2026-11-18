@@ -1,0 +1,30 @@
+{"id": "R01", "kind": "regular", "topic": "判断一个选题值不值得做，要看哪几条标准", "must_cite": ["选题判断的四条标准"], "should_refuse": false, "expect_claims": ["目标人群明确", "痛点具体", "有可验证资料", "3 分钟内讲清一个结论", "缺两条以上通常是自嗨"]}
+{"id": "R02", "kind": "regular", "topic": "团队周报的痛点集中在哪几处", "must_cite": ["周报自动化的典型场景"], "should_refuse": false, "expect_claims": ["信息散落在群聊、文档、代码仓库", "格式不统一要重排", "重复描述同一件事、字数虚高"]}
+{"id": "R03", "kind": "regular", "topic": "内容里最常见的事实错误有哪三类", "must_cite": ["事实核查的三类错误"], "should_refuse": false, "expect_claims": ["数字错", "主体错", "时序错"]}
+{"id": "R04", "kind": "regular", "topic": "人工中断应该放在流程的哪些位置", "must_cite": ["人工中断该放在哪里"], "should_refuse": false, "expect_claims": ["对外发布前", "涉及金额、承诺、法务表述时", "不是流程越长越安全"]}
+{"id": "R05", "kind": "regular", "topic": "评测的黄金集要多少条样本才够起步", "must_cite": ["评测的黄金集怎么建"], "should_refuse": false, "expect_claims": ["30 条起步", "10 条常规", "10 条边界", "10 条应拒答"]}
+{"id": "R06", "kind": "regular", "topic": "自嗨型选题一般有什么特征", "must_cite": ["选题判断的四条标准"], "should_refuse": false, "expect_claims": ["四条里缺两条以上", "目标人群不明确", "痛点不具体"]}
+{"id": "R07", "kind": "regular", "topic": "周报字数虚高是怎么造成的，怎么处理", "must_cite": ["周报自动化的典型场景"], "should_refuse": false, "expect_claims": ["重复描述同一件事", "Agent 做原始信息归并", "人只做判断与措辞"]}
+{"id": "R08", "kind": "regular", "topic": "数字错和主体错分别是什么，怎么避免", "must_cite": ["事实核查的三类错误"], "should_refuse": false, "expect_claims": ["同比环比混淆、口径不一致", "把 A 公司的数据说成 B 公司", "先抽断言再逐条比对"]}
+{"id": "R09", "kind": "regular", "topic": "对外发布前要不要人工审核", "must_cite": ["人工中断该放在哪里"], "should_refuse": false, "expect_claims": ["对外发布前需要人", "涉及承诺时也需要人"]}
+{"id": "R10", "kind": "regular", "topic": "黄金集为什么每条都要标注期望结论", "must_cite": ["评测的黄金集怎么建"], "should_refuse": false, "expect_claims": ["不标期望结论就评不出对错", "先有 30 条再谈覆盖率"]}
+{"id": "E01", "kind": "edge", "topic": "周报自动化里哪些环节交给 Agent，哪些必须留给人", "must_cite": ["周报自动化的典型场景", "人工中断该放在哪里"], "should_refuse": false, "expect_claims": ["Agent 做原始信息归并", "判断与措辞留给人", "发布前与涉及承诺处停下"]}
+{"id": "E02", "kind": "edge", "topic": "选题标准和黄金集标注之间有什么关系", "must_cite": ["选题判断的四条标准", "评测的黄金集怎么建"], "should_refuse": false, "expect_claims": ["选题要有可验证资料", "黄金集要标期望结论"]}
+{"id": "E03", "kind": "edge", "topic": "核查节点比对不到资料的时候应该怎么处理", "must_cite": ["事实核查的三类错误"], "should_refuse": false, "expect_claims": ["标未核实而不是猜", "先抽断言再逐条比对"]}
+{"id": "E04", "kind": "edge", "topic": "3 分钟讲不清结论的选题还要不要做", "must_cite": ["选题判断的四条标准"], "should_refuse": false, "expect_claims": ["能不能 3 分钟讲清一个结论", "缺两条以上是自嗨"]}
+{"id": "E05", "kind": "edge", "topic": "涉及金额和法务表述需不需要人工确认", "must_cite": ["人工中断该放在哪里"], "should_refuse": false, "expect_claims": ["涉及金额、承诺、法务表述时需要人"]}
+{"id": "E06", "kind": "edge", "topic": "30 条样本对评测来说是不是太少了", "must_cite": ["评测的黄金集怎么建"], "should_refuse": false, "expect_claims": ["30 条就够起步", "先有 30 条再谈覆盖率"]}
+{"id": "E07", "kind": "edge", "topic": "同比和环比混淆属于哪一类事实错误", "must_cite": ["事实核查的三类错误"], "should_refuse": false, "expect_claims": ["属于数字错", "口径不一致"]}
+{"id": "E08", "kind": "edge", "topic": "周报的原始信息散落在群聊和文档里，先做哪一步", "must_cite": ["周报自动化的典型场景"], "should_refuse": false, "expect_claims": ["先做原始信息归并", "人只做判断与措辞"]}
+{"id": "E09", "kind": "edge", "topic": "什么情况下自动化会变成半自动化", "must_cite": ["人工中断该放在哪里"], "should_refuse": false, "expect_claims": ["其它环节让人工介入", "会把自动化做成半自动"]}
+{"id": "E10", "kind": "edge", "topic": "知识库覆盖不到的选题还能不能评测", "must_cite": ["评测的黄金集怎么建", "选题判断的四条标准"], "should_refuse": false, "expect_claims": ["应拒答样本就是覆盖不到的题", "没有可验证资料就不该做"]}
+{"id": "X01", "kind": "refuse", "topic": "住房公积金贷款怎么申请", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}
+{"id": "X02", "kind": "refuse", "topic": "2026 年世界杯冠军是谁", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}
+{"id": "X03", "kind": "refuse", "topic": "Python 的装饰器怎么写", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}
+{"id": "X04", "kind": "refuse", "topic": "红烧肉怎么做才不腻", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}
+{"id": "X05", "kind": "refuse", "topic": "考研数学怎么复习", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}
+{"id": "X06", "kind": "refuse", "topic": "Kubernetes 的 Pod 是怎么调度的", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}
+{"id": "X07", "kind": "refuse", "topic": "北京明天天气怎么样", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}
+{"id": "X08", "kind": "refuse", "topic": "怎么和领导谈涨薪", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}
+{"id": "X09", "kind": "refuse", "topic": "比特币现在的价格是多少", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}
+{"id": "X10", "kind": "refuse", "topic": "手机电池不耐用怎么保养", "must_cite": [], "should_refuse": true, "expect_claims": ["知识库无相关资料，应拒答"]}

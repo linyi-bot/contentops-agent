@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from datetime import datetime
@@ -28,6 +29,23 @@ def get_retriever() -> Retriever:
     if _RETRIEVER is None:
         _RETRIEVER = Retriever()
     return _RETRIEVER
+
+
+#: 相关度闸门的默认阈值。来源：30 条黄金集里「应答题最低分 0.128」与
+#: 「应拒答题最高分 0.082」之间，取偏保守的 0.09。这是**在这批样本上校准**
+#: 的数，换知识库、换语料规模都要重标 —— 别把它当常数。
+#: `RETRIEVAL_MIN_SCORE=0` 可以关掉闸门跑基线对照。
+#: 已知局限：分数按查询词累加，超短查询（如单个「周报」）天然分低，会被误拒。
+DEFAULT_MIN_SCORE = "0.09"
+
+
+def min_score() -> float:
+    """当前生效的相关度阈值；每次调用都读环境变量，评测才能在一次进程里跑两种口径。"""
+    raw = os.getenv("RETRIEVAL_MIN_SCORE", DEFAULT_MIN_SCORE).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(DEFAULT_MIN_SCORE)
 
 
 def _event(node: str, t0: float, note: str) -> TraceEvent:
@@ -47,12 +65,19 @@ def retrieve_node(state: ContentState) -> dict:
     if not topic:
         return {"hits": [], "trace": [_event("retrieve", t0, "无选题，跳过检索")]}
 
-    hits: list[Hit] = get_retriever().search(topic, top_k=3)
-    note = (
-        f"命中 {len(hits)} 条，最高分 {hits[0]['score']:.3f}"
-        if hits
-        else "知识库无命中（草稿阶段会显式说明这一点）"
-    )
+    found: list[Hit] = get_retriever().search(topic, top_k=3)
+    threshold = min_score()
+    hits = [h for h in found if h["score"] >= threshold] if threshold > 0 else found
+
+    if found and not hits:
+        note = (
+            f"最高分 {found[0]['score']:.3f} 低于相关度阈值 {threshold:.2f}，"
+            "按「知识库无相关资料」处理（不拿不相关的资料硬凑草稿）"
+        )
+    elif hits:
+        note = f"命中 {len(hits)} 条，最高分 {hits[0]['score']:.3f}"
+    else:
+        note = "知识库无命中（草稿阶段会显式说明这一点）"
     return {"hits": hits, "trace": [_event("retrieve", t0, note)]}
 
 
