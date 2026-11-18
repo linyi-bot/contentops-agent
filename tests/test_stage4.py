@@ -39,7 +39,6 @@ def workdir() -> Path:
         shutil.rmtree(path, ignore_errors=True)
 
 
-
 def _env() -> dict[str, str]:
     """子进程也要能 import contentops —— 本机靠 .venv-libs，CI 靠 pip 装好的环境。"""
     env = dict(os.environ)
