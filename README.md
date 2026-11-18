@@ -117,11 +117,14 @@ contentops-agent/
 
 ---
 
-## 七、这台机器的环境坑（换机器可忽略）
+## 七、在受限环境里跑（可选）
+
+如果目标机器是「没有管理员权限 + 出网受限 + 系统 TLS 损坏」的那类环境，
+本项目刻意避开了三个依赖：不依赖 GPU、不依赖向量库、不依赖外部可观测平台。
+另外两个实测坑值得记下来：
 
 | 现象 | 真实原因 | 解法 |
 |---|---|---|
-| `pip install` 报 `PermissionError: ...whl` | Python 3.14 把 `os.mkdir(mode=0o700)` 应用到 Windows 目录 DACL，沙箱令牌访问不了 `tempfile.mkdtemp` 建的目录 | 用 `tools/pipx.py` 代替 `python -m pip` |
-| `curl` / PS 的 HTTPS 全挂 | 系统 schannel 凭证链损坏 | 一律用 Python `requests`，git 走 `http.sslBackend=openssl` |
-| pypi 直连超时 | 出网限制 | 用阿里云镜像 `mirrors.aliyun.com/pypi/simple/` |
-| `git` 命令不存在 | 本机没装 git，项目用的是工作区内的便携版 | 用 `tools\git.cmd`，不要直接敲 `git` |
+| `pip install` 报 `PermissionError: ...whl` | Python 3.14 会把 `os.mkdir(mode=0o700)` 应用到目录 DACL，而 `tempfile.mkdtemp()` 默认就用 0o700；受限令牌因此进不去自己刚建的目录 | 用一个包装脚本把 0o700 改成 0o777 再调 pip（见提交历史里的 `pipx.py`） |
+| `curl` / PowerShell 的 HTTPS 全挂 | schannel 凭证链损坏 | 出网一律走 Python `requests`；git 配 `http.sslBackend=openssl` |
+
