@@ -1,6 +1,14 @@
 # ContentOps Agent
 
+[![CI](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1f6feb)
+![Tests](https://img.shields.io/badge/tests-12%20passed-brightgreen)
+
 > 内容运营多智能体工作台 · LangGraph 编排 · 可评测、可观测、可复现
+
+仓库：<https://github.com/linyi-bot/contentops-agent>
+克隆：`git clone https://github.com/linyi-bot/contentops-agent.git`
 
 一个「选题 → 检索 → 起草 → 事实核查 → 人工审核 → 发布」的六节点流水线。
 它不是玩具 demo：每个节点都可单独测，每次运行留 trace，评测集能量化答对率与成本。
@@ -68,6 +76,10 @@ flowchart LR
 ## 三、快速开始
 
 ```bat
+:: 0) 拿代码（仓库已公开）
+git clone https://github.com/linyi-bot/contentops-agent.git
+cd contentops-agent
+
 :: 1) 依赖
 python -m pip install -r requirements.txt
 
@@ -142,7 +154,7 @@ contentops-agent/
 
 | 阶段 | 天数 | 产出 | 验收线 |
 |---|---|---|---|
-| 0 地基 | 1 | git / 依赖 / 仓库 / README / CI | `git push` 成功（待 GitHub 认证） |
+| 0 地基 | 1 | git / 依赖 / 仓库 / README / CI | ✅ 已推到 GitHub，Actions 跑 pytest |
 | 1 最小闭环 | 5 | 三节点 + 检索 + mock 模型 | 命令行跑通、有 commit ✅ |
 | 2 主项目 MVP | 7 | 六节点 + 事实核查 + 人工中断 + 打回重写 | ✅ 输入选题产出带引用稿子，12 条测试全绿 |
 | 3 工程化 | 5 | 评测集 + SQLite checkpointer + Docker + 打包 | pytest 绿、评测出报告 |
