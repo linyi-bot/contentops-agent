@@ -67,6 +67,10 @@ contentops resume --thread-id <tid> --db .contentops/cp.sqlite --decision approv
 **打开界面**：
 
 ```bat
+:: 演示用：双击这个文件（自动起服务 + 打开浏览器；那个黑窗口别关，关了就停服务）
+打开演示页面.cmd
+
+:: 或者手动
 contentops serve --port 8000
 :: Vue3 前端  http://127.0.0.1:8000/app/
 :: 服务端渲染版 http://127.0.0.1:8000/
