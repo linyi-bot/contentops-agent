@@ -3,12 +3,15 @@
 [![CI](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1f6feb)
-![Tests](https://img.shields.io/badge/tests-55%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-68%20passed-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 > 一条「选题 → 人工选 → 写稿 → 人工审 → 提炼图点 → 并行出图」的内容流水线
 > LangGraph 1.x 编排 · 两次真人中断 · 可观测 · 可跨进程恢复
 
 仓库：<https://github.com/linyi-bot/contentops-agent>
+
+**状态**：v0.6.0 · 68 条测试全绿 · CI 通过 · 六个节点 / 两次人工中断 / 三种状态后端 / Vue3 前端（无需构建）
 
 ---
 
