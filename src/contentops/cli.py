@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -332,6 +333,28 @@ def _cmd_llm_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_image_check(args: argparse.Namespace) -> int:
+    """花一张图的钱，验证出图通道到底通不通 —— 和 llm-check 对称。"""
+    from .image_service import build_image_service, describe_images
+
+    d = describe_images()
+    svc = build_image_service()
+    print(LINE)
+    print(f"出图通道：{d['name']}（IMAGE_PROVIDER={d['provider']}）")
+    if svc.name == "mock":
+        print("[!] 现在是 mock：没有 key 或没指定 provider，出的是占位 SVG。")
+        print("    要真出图：.env 里填 IMAGE_PROVIDER=seedream + ARK_API_KEY=...")
+    t0 = time.perf_counter()
+    r = svc.generate(args.prompt, index=1)
+    ms = int((time.perf_counter() - t0) * 1000)
+    if r.ok:
+        print(f"[OK] {ms} ms　URL：{r.url}")
+    else:
+        print(f"[X] {ms} ms　{r.error}")
+    print(LINE)
+    return 0 if r.ok else 2
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     from . import web
 
@@ -421,6 +444,10 @@ def main(argv: list[str] | None = None) -> int:
 
     pl = sub.add_parser("llm-check", help="验证模型 key / 网络（只花几个 token）")
     pl.set_defaults(func=_cmd_llm_check)
+
+    pi = sub.add_parser("image-check", help="验证出图通道（花一张图的钱）")
+    pi.add_argument("--prompt", default="一只坐在键盘上的橘猫，扁平插画风", help="出图提示词")
+    pi.set_defaults(func=_cmd_image_check)
 
     pe = sub.add_parser("eval", help="（旧流程的评测，正在重写）")
     pe.set_defaults(func=_cmd_eval)

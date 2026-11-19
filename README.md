@@ -76,6 +76,25 @@ contentops serve --port 8000
 
 ---
 
+## 界面
+
+真模型（deepseek-flash）+ 真出图（火山 Seedream）跑出来的样子，不是占位图：
+
+| 列表 | 选选题 |
+|---|---|
+| ![列表](docs/screenshots/ui-1-list.png) | ![选题](docs/screenshots/ui-2-select.png) |
+
+| 人工审核 | 成品（正文 / 图点 / 配图） |
+|---|---|
+| ![审核](docs/screenshots/ui-3-review.png) | ![成品](docs/screenshots/ui-4-done.jpg) |
+
+图里那条运行的实测数据：选题 1.4s / 写稿 3.2s（流式，能看到字一个个出来）/ 出图 31.7s 五张，
+总花费约 ¥1（文本 ¥0.002 + 图 ¥1）。
+
+---
+
+---
+
 ## 三、技术栈
 
 | 层 | 选型 | 为什么 |
@@ -220,6 +239,9 @@ IMAGE_BASE_URL=https://<你的中转站>
 
 1. **子图没直接挂在主图上**：直接把 `CompiledStateGraph` 当节点挂，每次 resume 主图会把子图连同上游重放一遍，`operator.add` 的 trace 会重复累加。所以包了一层 `_run_subgraph()`，只回传增量 —— 子图仍独立编译、可单测，但不参与父图的 checkpoint 语义。
 2. **时间旅行靠 config 里的 `checkpoint_id`**：`update_state(cfg, {})` 在该检查点开一条新分支，再 `invoke(None, cfg)` 往下跑。`update_state()` 没有 `checkpoint_id` 参数，别照着旧文档写。
+
+更细的取舍（10 条 ADR，含「为什么不接 LangSmith」「为什么前端不上 Vite」「为什么评测退役」）看
+[`docs/决策记录.md`](docs/决策记录.md)。
 
 ---
 

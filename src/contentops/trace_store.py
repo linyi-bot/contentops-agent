@@ -134,7 +134,7 @@ class TraceStore:
                     (
                         rid,
                         rid,
-                        str(state.get("topic") or ""),
+                        str(state.get("selected_topic") or state.get("topic_direction") or state.get("topic") or ""),
                         status_of(state, error),
                         mode,
                         db,
@@ -161,7 +161,7 @@ class TraceStore:
                 "updated_at=?",
             ]
             args: list[Any] = [
-                str(state.get("topic") or ""),
+                str(state.get("selected_topic") or state.get("topic_direction") or state.get("topic") or ""),
                 status_of(state, error),
                 int(state.get("revision") or 0),
                 len(events),

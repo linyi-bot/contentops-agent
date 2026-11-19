@@ -162,7 +162,7 @@ class SeedreamImageService:
 
     def __init__(self, api_key: str, *, model: str | None = None, size: str = "1024x1536") -> None:
         self.api_key = api_key
-        self.model = model or os.getenv("IMAGE_MODEL", "doubao-seedream-4-5-251128")
+        self.model = model or os.getenv("IMAGE_MODEL", "doubao-seedream-5-0-flash-260915")
         self.size = size
         self.base_url = os.getenv("IMAGE_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
 
@@ -201,10 +201,31 @@ class SeedreamImageService:
             if not url:
                 return ImageResult(prompt=prompt, ok=False, provider=self.name,
                                    error=f"响应里没有 url：{str(data)[:200]}")
-            return ImageResult(prompt=prompt, ok=True, provider=self.name, url=url)
+            # 方舟返回的是带签名的临时 URL（默认 24h 过期），顺手存一份本地：
+            # 页面就不用依赖「明天这条链接还活着」。
+            local = self._download(url, prompt, index)
+            return ImageResult(prompt=prompt, ok=True, provider=self.name,
+                               url=local or url, path=local)
         except Exception as exc:  # noqa: BLE001
             return ImageResult(prompt=prompt, ok=False, provider=self.name,
                                error=f"重试 {attempts} 次仍失败：{type(exc).__name__}: {exc}")
+
+    def _download(self, url: str, prompt: str, index: int) -> str:
+        """把远程图落到 outputs/images，返回 web 路径；失败就返回空串（继续用远程 URL）。"""
+        try:
+            import requests
+
+            out = Path(os.getenv("IMAGE_OUT_DIR") or DEFAULT_OUT_DIR)
+            out.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
+            path = out / f"img-{index:02d}-{digest}.jpeg"
+            resp = requests.get(url, timeout=60)
+            if resp.status_code != 200:
+                return ""
+            path.write_bytes(resp.content)
+            return f"/outputs/images/{path.name}"
+        except Exception:  # noqa: BLE001 - 存不下来不算失败，远程 URL 也能显示
+            return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -276,12 +297,80 @@ class GeminiImageService:
 
 
 # --------------------------------------------------------------------------- #
+# OpenAI 兼容的中转（硅基流动 / 302.ai / 各种 base64 或 url 返回）
+# --------------------------------------------------------------------------- #
+
+
+class OpenAICompatImageService:
+    """`POST {base}/images/generations`，和 OpenAI 一个形状。
+
+    国内大部分中转（硅基流动、302.ai、各类加速站）都是这个协议，
+    所以这一个类能覆盖「除了火山和 gemini 之外」的绝大多数通道。
+    """
+
+    name = "openai"
+
+    def __init__(self, api_key: str, base_url: str, *, model: str | None = None,
+                 out_dir: str | Path | None = None) -> None:
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.model = model or os.getenv("IMAGE_MODEL", "Kwai-Kolors/Kolors")
+        self.out_dir = Path(out_dir or os.getenv("IMAGE_OUT_DIR") or DEFAULT_OUT_DIR)
+
+    def generate(self, prompt: str, *, index: int = 1) -> ImageResult:
+        try:
+            import requests
+        except ModuleNotFoundError:
+            return ImageResult(prompt=prompt, ok=False, provider=self.name,
+                               error="缺 requests：pip install requests")
+
+        attempts = int(os.getenv("IMAGE_RETRIES", "2")) + 1
+
+        def call():
+            resp = requests.post(
+                f"{self.base_url}/images/generations",
+                headers={"Authorization": f"Bearer {self.api_key}",
+                         "Content-Type": "application/json"},
+                json={"model": self.model, "prompt": prompt, "n": 1,
+                      "size": os.getenv("IMAGE_SIZE", "1024x1536")},
+                timeout=180,
+            )
+            if resp.status_code in RETRY_STATUS:
+                raise RuntimeError(f"可重试的 HTTP {resp.status_code}")
+            return resp
+
+        try:
+            resp = _retry(call, attempts=attempts)
+            if resp.status_code >= 400:
+                return ImageResult(prompt=prompt, ok=False, provider=self.name,
+                                   error=f"HTTP {resp.status_code}: {resp.text[:200]}")
+            item = (resp.json().get("data") or [{}])[0]
+            if item.get("url"):
+                return ImageResult(prompt=prompt, ok=True, provider=self.name, url=item["url"])
+            if item.get("b64_json"):
+                self.out_dir.mkdir(parents=True, exist_ok=True)
+                digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
+                path = self.out_dir / f"img-{index:02d}-{digest}.png"
+                path.write_bytes(base64.b64decode(item["b64_json"]))
+                return ImageResult(prompt=prompt, ok=True, provider=self.name,
+                                   url=f"/outputs/images/{path.name}", path=str(path))
+            return ImageResult(prompt=prompt, ok=False, provider=self.name,
+                               error=f"响应里既没有 url 也没有 b64_json：{str(resp.json())[:200]}")
+        except Exception as exc:  # noqa: BLE001
+            return ImageResult(prompt=prompt, ok=False, provider=self.name,
+                               error=f"重试 {attempts} 次仍失败：{type(exc).__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------- #
 # 工厂
 # --------------------------------------------------------------------------- #
 
 
 def build_image_service() -> ImageService:
     """按环境变量挑通道；**没有 key 就回落 mock**，和 llm.build_llm 一个脾气。"""
+    from .llm import load_dotenv  # 延迟导入：避免 image_service ↔ llm 循环
+
+    load_dotenv()  # 让「.env 里填 key」真的生效（和模型那边一致）
     provider = os.getenv("IMAGE_PROVIDER", "").strip().lower()
     if not provider:
         # 没显式指定：有火山 key 用火山，有中转 key 用 gemini，都没有就 mock
@@ -301,6 +390,12 @@ def build_image_service() -> ImageService:
         key = os.getenv("IMAGE_API_KEY", "").strip()
         if key:
             return GeminiImageService(key)
+        return MockImageService()
+    if provider in {"openai", "compat", "relay"}:
+        key = os.getenv("IMAGE_API_KEY", "").strip()
+        base = os.getenv("IMAGE_BASE_URL", "").strip()
+        if key and base:
+            return OpenAICompatImageService(key, base)
         return MockImageService()
     return MockImageService()
 

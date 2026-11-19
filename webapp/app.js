@@ -151,6 +151,9 @@ createApp({
 
     onMounted(async () => {
       try { await loadRuns(); } catch (e) { error.value = String(e.message || e); }
+      // 支持 `/app/#run=run-xxxx` 直达某条运行 —— 分享链接、截图、面试演示都靠它
+      const m = (location.hash || "").match(/run=([\w-]+)/);
+      if (m) { openRun(m[1]).catch(() => {}); }
       timer = setInterval(tick, 4000);
     });
     onUnmounted(() => timer && clearInterval(timer));
