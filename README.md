@@ -3,7 +3,7 @@
 [![CI](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/linyi-bot/contentops-agent/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.x-1f6feb)
-![Tests](https://img.shields.io/badge/tests-68%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-77%20passed-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 > 一条「选题 → 人工选 → 写稿 → 人工审 → 提炼图点 → 并行出图」的内容流水线
@@ -11,7 +11,7 @@
 
 仓库：<https://github.com/linyi-bot/contentops-agent>
 
-**状态**：v0.6.0 · 68 条测试全绿 · CI 通过 · 六个节点 / 两次人工中断 / 三种状态后端 / Vue3 前端（无需构建）
+**状态**：v0.7.0 · 77 条测试全绿 · CI 通过 · 六个节点 / 两次人工中断 / 三种状态后端 / Vue3 前端（无需构建）
 
 ---
 
@@ -240,25 +240,54 @@ IMAGE_BASE_URL=https://<你的中转站>
 1. **子图没直接挂在主图上**：直接把 `CompiledStateGraph` 当节点挂，每次 resume 主图会把子图连同上游重放一遍，`operator.add` 的 trace 会重复累加。所以包了一层 `_run_subgraph()`，只回传增量 —— 子图仍独立编译、可单测，但不参与父图的 checkpoint 语义。
 2. **时间旅行靠 config 里的 `checkpoint_id`**：`update_state(cfg, {})` 在该检查点开一条新分支，再 `invoke(None, cfg)` 往下跑。`update_state()` 没有 `checkpoint_id` 参数，别照着旧文档写。
 
-更细的取舍（10 条 ADR，含「为什么不接 LangSmith」「为什么前端不上 Vite」「为什么评测退役」）看
+更细的取舍（10 条 ADR，含「为什么不接 LangSmith」「为什么前端不上 Vite」「旧评测为什么退役」）看
 [`docs/决策记录.md`](docs/决策记录.md)。
 
 ---
 
-## 十一、已知限制（写在明处）
+## 十一、评测（阶段 9）
 
-- **token 级流式没做**：SSE 只推节点级（`stream_mode="updates"`）；token 级要 LLM 客户端先接流式。
-- **旧评测集退役了**：黄金集评测跟的是「检索+事实核查」那套流程，流程换掉后暂不可用，
-  `contentops eval` 现在只打印说明。下一版会按新流程重做（选题质量 / 成稿通过率 / 出图成功率）。
-- **前端没打包**：`webapp/` 是「Vue 3 全局构建 + 一个 app.js」，不是 SFC，也没有 Vite；
-  好处是打开即用，代价是没法用单文件组件语法。
+上一版的评测跟的是「检索 + 事实核查」，流程换掉后整条退役了。这一版按新流程重新定义**四项可机判指标**，
+数据集是 12 条真实选题方向（`evals/topics/golden.jsonl`）：
+
+```bat
+contentops eval                      :: 全量 12 条，出报告到 reports/
+contentops eval --limit 3            :: 抽三条先看看
+contentops eval --image-provider ... :: 出图通道由环境变量决定
+```
+
+| 指标 | 机器判什么 | 本次（v2） |
+|---|---|---:|
+| 选题合格率 | 长度 8-24、无标题党词、5 条之间不同质（二字组重合 ≤ 0.8） | **96.7%** |
+| 成稿合格率 | 250-1200 字、≥2 段、有小标题 | **100%** |
+| 图点合格率 | 6-24 字、与正文有交集（中文字 + 英文词都算） | **97.9%** |
+| 出图成功率 | 成功张数 / 图点张数 | **100%**（mock 通道） |
+
+**11 / 12 通过**，平均 5369 ms、P95 6523 ms，12 条共 13352 token，**花费 ¥0.0284**。
+
+失败的那条也留着：`Cursor 和 Claude Code 怎么选` —— 模型给出的两个选题被规则判为「同质」
+（都是「Cursor + Claude Code + 对比」的变体），一个图点被判「与正文交集不足」。
+**这条没修**，因为它是真实缺陷，不是规则的错。
+
+报告里有「口径」一节，写明这四项**只测形状、不测内容质量**，别拿它当「准确率」讲。
 
 ---
 
-## 十一、版本
+## 十二、已知限制（写在明处）
+
+- **评测不测内容质量**：四项指标都是形状约束，好文笔、事实正确与否机器判不了；
+- **只采样一次**：没有做多次采样取均值，稳定性还没量化（`--repeat` 未实现）；
+- **前端没打包**：`webapp/` 是「Vue 3 全局构建 + 一个 app.js」，不是 SFC，也没有 Vite；
+  好处是打开即用，代价是没法用单文件组件语法。
+- **Docker 镜像本机没 build 过**：文件齐（Dockerfile / compose / smoke 脚本），但这台机器没启 WSL2。
+
+---
+
+## 十三、版本
 
 | 版本 | 变更 |
 |---|---|
+| 0.7.0 | 按新流程重做评测：四项可机判指标 + 12 条黄金方向 + 报告与口径（77 passed） |
 | 0.6.0 | 工程纵深补齐：子图、结构化输出、时间旅行、token 级流式、JWT、双平台发布、多模型路由、出图重试（68 passed） |
 | 0.5.0 | 换成「自媒体运营」六节点流程：两次 `interrupt`、并行出图、Vue3 前端、三种 checkpointer |
 | 0.4.0 | 事实核查回写环 + 30 条黄金集评测（已随流程退役） |

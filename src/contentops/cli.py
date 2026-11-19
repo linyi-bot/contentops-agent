@@ -396,9 +396,38 @@ def _cmd_rewind(args: argparse.Namespace) -> int:
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
-    print("[!] 旧的黄金集评测跟的是「核查+发布」流程；换成项目二流程后正在重写。")
-    print("    当前可用的验证方式：pytest（含真起两个进程的跨进程恢复）。")
-    return 2
+    """跑黄金方向集，出「四项可机判指标」的报告。"""
+    from .eval import run_eval
+
+    print(LINE)
+    print(f"数据集：{args.dataset}　最多 {args.limit or '全部'} 条　挑第 {args.pick} 个选题")
+    _print_model()
+    from .image_service import describe_images
+
+    print(f"出图通道：{describe_images()['name']}")
+    print(LINE)
+
+    results, summary, path = run_eval(
+        args.dataset, limit=args.limit, out=args.out or None, label=args.label, pick=args.pick
+    )
+
+    print("\n【汇总】")
+    for key in ("样本", "通过", "选题合格率", "成稿合格率", "图点合格率", "出图成功率"):
+        print(f"  {key:<8}{summary[key]}")
+    print(f"  平均耗时 {summary['平均耗时ms']} ms　P95 {summary['P95耗时ms']} ms")
+    print(f"  总 token {summary['总token']}　估算 ¥{summary['总成本']:.4f}")
+    if path:
+        print(f"\n报告：{path}")
+    for r in results:
+        if not r.passed and not r.error:
+            print(f"  [!] {r.direction}：选题 {r.topic_rate:.0%} / 图点 {r.point_rate:.0%}")
+        elif r.error:
+            print(f"  [X] {r.direction}：{r.error}")
+
+    if args.json:
+        print("\n【raw】")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -449,7 +478,13 @@ def main(argv: list[str] | None = None) -> int:
     pi.add_argument("--prompt", default="一只坐在键盘上的橘猫，扁平插画风", help="出图提示词")
     pi.set_defaults(func=_cmd_image_check)
 
-    pe = sub.add_parser("eval", help="（旧流程的评测，正在重写）")
+    pe = sub.add_parser("eval", help="跑黄金方向集，出四项可机判指标的报告")
+    pe.add_argument("--dataset", default="evals/topics/golden.jsonl", help="数据集（jsonl，每行一个 direction）")
+    pe.add_argument("--limit", type=int, default=0, help="只跑前 N 条（调试用）")
+    pe.add_argument("--pick", type=int, default=1, help="每条自动选第几个选题（1 基）")
+    pe.add_argument("--out", default="reports", help="报告输出目录（留空只打印）")
+    pe.add_argument("--label", default="", help="报告文件名后缀，如 real-model")
+    pe.add_argument("--json", action="store_true", help="额外打印汇总 JSON")
     pe.set_defaults(func=_cmd_eval)
 
     pv = sub.add_parser("serve", help="起页面：看运行 / 选选题 / 审稿 / 出图")
