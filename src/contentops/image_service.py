@@ -20,12 +20,34 @@ import base64
 import hashlib
 import os
 import textwrap
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol, TypeVar
 
 #: 默认出图落盘目录（相对当前工作目录）；web 通过 /outputs 静态暴露
 DEFAULT_OUT_DIR = Path("outputs") / "images"
+
+#: 出图重试：422/429/5xx 和网络抖动都值得再试一次（同步 API，不给你回调）。
+RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+_sleep = time.sleep  # 测试里替换掉，别真的等 1+2+4 秒
+
+T = TypeVar("T")
+
+
+def _retry(fn: Callable[[], T], *, attempts: int = 3, base: float = 1.0) -> T:
+    """指数退避：1s → 2s → 4s。最后一次失败把异常抛出去，由调用方记成 error。"""
+    last: Exception | None = None
+    for i in range(max(1, attempts)):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if i < attempts - 1:
+                _sleep(base * (2**i))
+    assert last is not None
+    raise last
 
 
 @dataclass
@@ -151,7 +173,9 @@ class SeedreamImageService:
             return ImageResult(prompt=prompt, ok=False, provider=self.name,
                                error="缺 requests：pip install requests")
 
-        try:
+        attempts = int(os.getenv("IMAGE_RETRIES", "2")) + 1
+
+        def call():
             resp = requests.post(
                 f"{self.base_url.rstrip('/')}/images/generations",
                 headers={"Authorization": f"Bearer {self.api_key}"},
@@ -163,6 +187,12 @@ class SeedreamImageService:
                 },
                 timeout=120,
             )
+            if resp.status_code in RETRY_STATUS:
+                raise RuntimeError(f"可重试的 HTTP {resp.status_code}")
+            return resp
+
+        try:
+            resp = _retry(call, attempts=attempts)
             if resp.status_code >= 400:
                 return ImageResult(prompt=prompt, ok=False, provider=self.name,
                                    error=f"HTTP {resp.status_code}: {resp.text[:200]}")
@@ -174,7 +204,7 @@ class SeedreamImageService:
             return ImageResult(prompt=prompt, ok=True, provider=self.name, url=url)
         except Exception as exc:  # noqa: BLE001
             return ImageResult(prompt=prompt, ok=False, provider=self.name,
-                               error=f"{type(exc).__name__}: {exc}")
+                               error=f"重试 {attempts} 次仍失败：{type(exc).__name__}: {exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -204,7 +234,9 @@ class GeminiImageService:
             return ImageResult(prompt=prompt, ok=False, provider=self.name,
                                error="缺 IMAGE_BASE_URL（中转站地址）")
 
-        try:
+        attempts = int(os.getenv("IMAGE_RETRIES", "2")) + 1
+
+        def call():
             resp = requests.post(
                 f"{self.base_url}/v1beta/models/{self.model}:generateContent",
                 headers={"Authorization": f"Bearer {self.api_key}",
@@ -215,6 +247,12 @@ class GeminiImageService:
                 },
                 timeout=180,
             )
+            if resp.status_code in RETRY_STATUS:
+                raise RuntimeError(f"可重试的 HTTP {resp.status_code}")
+            return resp
+
+        try:
+            resp = _retry(call, attempts=attempts)
             if resp.status_code >= 400:
                 return ImageResult(prompt=prompt, ok=False, provider=self.name,
                                    error=f"HTTP {resp.status_code}: {resp.text[:200]}")

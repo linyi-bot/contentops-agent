@@ -71,9 +71,20 @@ def _print_result(state: ArticleState, *, out: str = "") -> None:
         print(f"  图 {i}: {u}")
     for e in state.get("image_errors") or []:
         print(f"  [!] {e}")
+    published = state.get("published") or {}
+    if published:
+        print("  已生成两个平台版本：" + "、".join(
+            f"{k}（{len(str(published[k].get('body') or ''))} 字）"
+            for k in ("xiaohongshu", "wechat") if k in published
+        ))
     if out:
+        from .output import write_publish
+
         path = write_markdown(state, Path(out))
+        files = write_publish(state, Path(out))
         print(f"\n已写出：{path}")
+        for f in files:
+            print(f"  {f}")
     print(LINE)
 
 
@@ -328,6 +339,39 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return web.serve(host=args.host, port=args.port)
 
 
+def _cmd_history(args: argparse.Namespace) -> int:
+    """列出这条会话的所有检查点 —— 每个都能拿去 rewind。"""
+    from .graph import history as graph_history
+
+    db = _db_arg(args.db)
+    pg = _pg_arg(args.pg)
+    with session(args.thread_id, db=db or None, pg=pg or None) as (app, tid):
+        rows = graph_history(app, tid)
+    print(f"会话 {tid} 共 {len(rows)} 个检查点（新的在前）")
+    for r in rows:
+        mark = "⟳" if r["interrupt"] else " "
+        print(f"  {mark} step={r['step']:>2}  第{r['revision']}版  "
+              f"{'有稿' if r['has_draft'] else '无稿'}  图{r['images']}  "
+              f"{r['checkpoint_id'][:8]}  next={r['next']}")
+    return 0
+
+
+def _cmd_rewind(args: argparse.Namespace) -> int:
+    """回到某个检查点重跑（时间旅行）。"""
+    from .graph import rewind as graph_rewind
+
+    db = _db_arg(args.db)
+    pg = _pg_arg(args.pg)
+    with session(args.thread_id, db=db or None, pg=pg or None) as (app, tid):
+        state = graph_rewind(app, tid, args.checkpoint, args.ns)
+        if is_interrupted(state):
+            pkt = interrupt_payload(state) or {}
+            print(_pause_hint(tid, db, pg, step=pkt.get("step", "")))
+            return EXIT_PAUSED
+    _print_result(state, out=args.out)
+    return 0
+
+
 def _cmd_eval(args: argparse.Namespace) -> int:
     print("[!] 旧的黄金集评测跟的是「核查+发布」流程；换成项目二流程后正在重写。")
     print("    当前可用的验证方式：pytest（含真起两个进程的跨进程恢复）。")
@@ -385,6 +429,21 @@ def main(argv: list[str] | None = None) -> int:
     pv.add_argument("--host", default="127.0.0.1")
     pv.add_argument("--port", type=int, default=8000)
     pv.set_defaults(func=_cmd_serve)
+
+    ph = sub.add_parser("history", help="列出会话的所有检查点（时间旅行的入口）")
+    ph.add_argument("--thread-id", required=True)
+    ph.add_argument("--db", default="")
+    ph.add_argument("--pg", default="")
+    ph.set_defaults(func=_cmd_history)
+
+    pw = sub.add_parser("rewind", help="回到某个检查点重跑（时间旅行）")
+    pw.add_argument("--thread-id", required=True)
+    pw.add_argument("--checkpoint", required=True)
+    pw.add_argument("--ns", default="", help="检查点命名空间（history 里能看到，一般是空）")
+    pw.add_argument("--out", default="")
+    pw.add_argument("--db", default="")
+    pw.add_argument("--pg", default="")
+    pw.set_defaults(func=_cmd_rewind)
 
     args = p.parse_args(argv)
     try:

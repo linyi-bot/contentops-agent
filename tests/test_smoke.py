@@ -51,7 +51,7 @@ def test_full_flow_stops_twice_then_draws():
     assert not is_interrupted(state)
     assert len(state["visual_points"]) == 4
     assert len(state["image_urls"]) == 4
-    assert state["status"] == "done"
+    assert state["status"] == "published"
 
     assert [e["node"] for e in state["trace"]] == [
         "plan_topics",
@@ -60,7 +60,9 @@ def test_full_flow_stops_twice_then_draws():
         "human_review",
         "extract_visuals",
         "generate_images",
+        "publish",
     ]
+    assert state["published"]["xiaohongshu"]["images"] == state["image_urls"]
 
 
 def test_markdown_contains_points_and_images(work):

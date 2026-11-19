@@ -19,10 +19,13 @@ from __future__ import annotations
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from .image_service import build_image_service
 from .llm import LLM, build_llm, usage_snapshot
+from .schemas import TopicList, VisualList
 from .state import (
     ArticleState,
     NodeMetric,
@@ -30,6 +33,19 @@ from .state import (
     SelectPacket,
     TraceEvent,
 )
+
+#: 写稿时的「吐字出口」。SSE 端点跑图前把它设上，节点就会边生成边回调。
+_TOKEN_SINK: ContextVar[Any] = ContextVar("token_sink", default=None)
+
+
+@contextmanager
+def token_sink(fn):
+    """在 with 块里把 `write_draft` 的 token 逐个吐给 `fn`（SSE 用）。"""
+    token = _TOKEN_SINK.set(fn)
+    try:
+        yield
+    finally:
+        _TOKEN_SINK.reset(token)
 
 # --------------------------------------------------------------------------- #
 # 公共小工具
@@ -82,6 +98,12 @@ TOPIC_SYSTEM = """你是小红书内容策划，服务一家做 AI 编程培训�
 2. 标题 12-20 字，带具体收益或反差，不要标题党；
 3. 5 个选题角度要不同（工具、方法、踩坑、对比、案例）。"""
 
+#: 结构化版：JSON Mode 用这个，模型直接给 dict，解析这一层就没什么可错的了
+TOPIC_SYSTEM_JSON = """你是小红书内容策划，服务一家做 AI 编程培训的教育公司。
+根据给定方向出 5 个技术干货型选题，严格输出 JSON：
+{"topics": ["标题1", "标题2", "标题3", "标题4", "标题5"]}
+要求：每个标题 12-20 字，角度不同（工具/方法/踩坑/对比/案例），不要输出 JSON 以外的任何字符。"""
+
 DRAFT_SYSTEM = """你是内容运营，写一篇中文技术干货短文，发布在小红书。
 硬规则：
 1. 500 字以内，分 3 段，每段一个小标题（用「一、二、三、」开头）；
@@ -95,30 +117,35 @@ VISUAL_SYSTEM = """你是视觉编辑，把一篇小红书文案拆成配图脚�
 2. 每个描述 10-16 字，是一张图要表达的内容（不是标题重复）；
 3. 4 个图点覆盖：痛点、方法、步骤、结论；不要任何解释。"""
 
-
-# --------------------------------------------------------------------------- #
-# 1. 出选题
-# --------------------------------------------------------------------------- #
+VISUAL_SYSTEM_JSON = """你是视觉编辑，把一篇小红书文案拆成配图脚本，严格输出 JSON：
+{"points": ["描述1", "描述2", "描述3", "描述4"]}
+要求：每个描述 10-16 字，分别覆盖痛点/方法/步骤/结论，不要输出 JSON 以外的任何字符。"""
 
 
 def plan_topics_node(state: ArticleState) -> dict:
     t0 = time.perf_counter()
     direction = (state.get("topic_direction") or "").strip()
-    llm: LLM = build_llm()
+    llm: LLM = build_llm("cheap")
+    prompt = f"方向：{direction}\n平台：{state.get('platform', 'xiaohongshu')}"
 
     before = usage_snapshot()
+    topics: list[str] = []
     try:
-        raw = llm.complete(TOPIC_SYSTEM, f"方向：{direction}\n平台：{state.get('platform', 'xiaohongshu')}",
-                           max_tokens=400)
-        topics = _numbered_lines(raw, limit=5)
+        topics = list(llm.complete_json(TOPIC_SYSTEM_JSON, prompt, TopicList, max_tokens=500).topics)
         spent = _delta(before)
-        note = f"模型 {llm.name} 出了 {len(topics)} 个选题"
+        note = f"模型 {llm.name} 出了 {len(topics)} 个选题（结构化）"
         if spent:
-            note += f"（{spent} tokens）"
-    except Exception as exc:  # noqa: BLE001 - 模型挂了也要让人能继续选
-        topics = [f"{direction}：一个可以马上用的方法"]
-        spent = 0
-        note = f"选题生成失败已降级：{type(exc).__name__}"
+            note += f"，{spent} tokens"
+    except Exception as exc:  # noqa: BLE001 - 结构化失败退回文本解析
+        try:
+            raw = llm.complete(TOPIC_SYSTEM, prompt, max_tokens=400)
+            topics = _numbered_lines(raw, limit=5)
+            spent = _delta(before)
+            note = f"结构化失败（{type(exc).__name__}），退回文本解析得到 {len(topics)} 个"
+        except Exception as exc2:  # noqa: BLE001
+            topics = [f"{direction}：一个可以马上用的方法"]
+            spent = 0
+            note = f"选题生成失败已降级：{type(exc2).__name__}"
 
     return {
         "generated_topics": topics,
@@ -193,27 +220,43 @@ def write_draft_node(state: ArticleState) -> dict:
     topic = state.get("selected_topic") or state.get("topic_direction", "")
     feedback = (state.get("review_feedback") or "").strip()
     revision = int(state.get("revision") or 0) + 1
-    llm: LLM = build_llm()
+    llm: LLM = build_llm("smart")
 
     user = f"选题：{topic}"
     if feedback:
         user += f"\n\n上一版被打回，修改意见（这次必须改）：\n{feedback}"
 
+    sink = _TOKEN_SINK.get()
     before = usage_snapshot()
+    streamed = False
     try:
-        draft = _clean(llm.complete(DRAFT_SYSTEM, user, max_tokens=900))
-        if feedback:
-            draft = draft  # 模型自己参考意见重写；这里不强加标记，避免污染正文
+        if sink is not None:
+            # SSE 场景：一个字一个字吐出去，前端能看到「正在写」
+            parts: list[str] = []
+            for chunk in llm.stream_complete(DRAFT_SYSTEM, user, max_tokens=900):
+                parts.append(chunk)
+                sink(chunk)
+            draft = _clean("".join(parts))
+            streamed = True
+        else:
+            draft = _clean(llm.complete(DRAFT_SYSTEM, user, max_tokens=900))
         spent = _delta(before)
         note = f"第 {revision} 版，{len(draft)} 字"
+        if streamed:
+            note += "（流式）"
         if feedback:
             note += "（按意见重写）"
         if spent:
             note += f"，{spent} tokens"
-    except Exception as exc:  # noqa: BLE001
-        draft = f"（这一版生成失败：{type(exc).__name__}）\n选题：{topic}"
-        spent = 0
-        note = f"第 {revision} 版，模型调用失败已降级：{type(exc).__name__}"
+    except Exception as exc:  # noqa: BLE001 - 流式失败退回一次性调用
+        try:
+            draft = _clean(llm.complete(DRAFT_SYSTEM, user, max_tokens=900))
+            spent = _delta(before)
+            note = f"第 {revision} 版，{len(draft)} 字（流式失败：{type(exc).__name__}）"
+        except Exception as exc2:  # noqa: BLE001
+            draft = f"（这一版生成失败：{type(exc2).__name__}）\n选题：{topic}"
+            spent = 0
+            note = f"第 {revision} 版，模型调用失败已降级：{type(exc2).__name__}"
 
     return {
         "article_content": draft,
@@ -268,20 +311,26 @@ def human_review_node(state: ArticleState) -> dict:
 def extract_visuals_node(state: ArticleState) -> dict:
     t0 = time.perf_counter()
     content = state.get("article_content", "")
-    llm: LLM = build_llm()
+    llm: LLM = build_llm("cheap")
 
     before = usage_snapshot()
     try:
-        raw = llm.complete(VISUAL_SYSTEM, f"文案：\n{content}", max_tokens=300)
-        points = _numbered_lines(raw, limit=5) or _fallback_points(content)
+        points = list(llm.complete_json(VISUAL_SYSTEM_JSON, f"文案：\n{content}",
+                                        VisualList, max_tokens=300).points)
         spent = _delta(before)
-        note = f"提炼出 {len(points)} 个图点"
+        note = f"提炼出 {len(points)} 个图点（结构化）"
         if spent:
-            note += f"（{spent} tokens）"
-    except Exception as exc:  # noqa: BLE001
-        points = _fallback_points(content)
-        spent = 0
-        note = f"提炼失败已降级：{type(exc).__name__}"
+            note += f"，{spent} tokens"
+    except Exception as exc:  # noqa: BLE001 - 结构化失败退回文本解析
+        try:
+            raw = llm.complete(VISUAL_SYSTEM, f"文案：\n{content}", max_tokens=300)
+            points = _numbered_lines(raw, limit=5) or _fallback_points(content)
+            spent = _delta(before)
+            note = f"结构化失败（{type(exc).__name__}），文本解析出 {len(points)} 个"
+        except Exception as exc2:  # noqa: BLE001
+            points = _fallback_points(content)
+            spent = 0
+            note = f"提炼失败已降级：{type(exc2).__name__}"
 
     return {
         "visual_points": points,
@@ -333,3 +382,46 @@ def generate_images_node(state: ArticleState) -> dict:
         "status": "done" if urls else "images_failed",
         **_finish("generate_images", t0, note),
     }
+
+
+# --------------------------------------------------------------------------- #
+# 7. 双平台发布（小红书 / 公众号）
+# --------------------------------------------------------------------------- #
+
+
+def publish_node(state: ArticleState) -> dict:
+    """同一份内容，按两个平台的形态各出一版。
+
+    - 小红书：短文案（截 300 字）+ 图集 + 话题标签；
+    - 公众号：长文（保留小标题）+ 图点作为配图规划。
+
+    这里只组装，不写盘 —— 落盘由 `output.write_publish()` 负责，
+    节点保持可测（单测跑链路不该在仓库里撒文件）。
+    """
+    t0 = time.perf_counter()
+    topic = state.get("selected_topic") or state.get("topic_direction", "")
+    body = (state.get("article_content") or "").strip()
+    urls = list(state.get("image_urls") or [])
+    points = list(state.get("visual_points") or [])
+
+    short = body[:300] + ("…" if len(body) > 300 else "")
+    tags = " ".join(f"#{t}" for t in ["AI编程", "效率工具", str(topic)[:10]])
+
+    published = {
+        "xiaohongshu": {
+            "platform": "xiaohongshu",
+            "title": topic,
+            "body": f"{short}\n\n{tags}",
+            "images": urls,
+        },
+        "wechat": {
+            "platform": "wechat",
+            "title": topic,
+            "body": body,
+            "images": points,  # 公众号侧先给配图规划，正文排版交给编辑器
+        },
+        "published_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    note = f"小红书 {len(urls)} 图 / 公众号 {len(body)} 字"
+    return {"published": published, "status": "published", **_finish("publish", t0, note)}

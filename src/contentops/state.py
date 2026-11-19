@@ -83,6 +83,9 @@ class ArticleState(TypedDict, total=False):
     image_urls: list[str]  # 出图结果（本地路径或远端 URL）
     image_errors: list[str]  # 失败的图点，不藏着
 
+    # 发布阶段
+    published: dict[str, Any]  # {"xiaohongshu": {...}, "wechat": {...}}
+
     # 流程状态（给页面显示）
     status: str
 

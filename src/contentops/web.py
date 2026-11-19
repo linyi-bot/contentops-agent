@@ -15,20 +15,33 @@ from __future__ import annotations
 import html
 import json
 import os
+import queue
+import threading
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from . import auth as auth_mod
 from .checkpoint import resolve_db
-from .graph import config_for, initial_input, resume, session, start
+from .graph import (
+    config_for,
+    history as graph_history,
+    initial_input,
+    resume as graph_resume,
+    rewind as graph_rewind,
+    session,
+    start,
+)
+from langgraph.types import Command
 from .image_service import describe_images
 from .llm import describe, usage_snapshot
-from .output import slug_for, write_markdown
+from .nodes import token_sink
+from .output import slug_for, write_markdown, write_publish
 from .trace_store import TraceStore, usage_delta
 
 try:
-    from fastapi import Body, FastAPI, Form, HTTPException
+    from fastapi import Body, Depends, FastAPI, Form, Header, HTTPException
     from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
     from fastapi.staticfiles import StaticFiles
 except ModuleNotFoundError as exc:  # 没装 fastapi 时给一句能照做的话
@@ -298,7 +311,7 @@ def select_topic(run_id: str, selected_topic: str = Form("")) -> RedirectRespons
     before = usage_snapshot()
     try:
         with session(run_id, db=db) as (app, tid):
-            state = resume(app, {"selected_topic": selected_topic}, tid)
+            state = graph_resume(app, {"selected_topic": selected_topic}, tid)
         store.sync(state, run_id=run_id, db=db, mode=_model(),
                    usage=usage_delta(before, usage_snapshot()))
     except Exception as exc:  # noqa: BLE001
@@ -318,7 +331,7 @@ def review(run_id: str, decision: str = Form("approve"), note: str = Form("")) -
     before = usage_snapshot()
     try:
         with session(run_id, db=db) as (app, tid):
-            state = resume(app, {"decision": decision, "feedback": note.strip()}, tid)
+            state = graph_resume(app, {"decision": decision, "feedback": note.strip()}, tid)
         store.sync(state, run_id=run_id, db=db, mode=_model(),
                    usage=usage_delta(before, usage_snapshot()))
         if state.get("image_urls"):
@@ -446,13 +459,46 @@ if WEBAPP_DIR.exists():
 # --------------------------------------------------------------------------- #
 
 
+def current_user(authorization: str = Header(default="")) -> str:
+    """`CONTENTOPS_AUTH=on` 时校验 Bearer token；关着就返回 local（本地演示不折腾）。"""
+    if not auth_mod.auth_required():
+        return "local"
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "缺少 Authorization: Bearer <token>")
+    try:
+        return str(auth_mod.decode_token(authorization[7:]).get("sub", ""))
+    except ValueError as exc:
+        raise HTTPException(401, f"token 无效：{exc}") from exc
+
+
+@app.post("/api/auth/register")
+def api_register(payload: dict = Body(...)) -> JSONResponse:
+    ok, err = auth_mod.register(str(payload.get("username", "")), str(payload.get("password", "")))
+    if not ok:
+        raise HTTPException(400, err)
+    return JSONResponse({"token": auth_mod.create_token(str(payload["username"]).strip())})
+
+
+@app.post("/api/auth/login")
+def api_login(payload: dict = Body(...)) -> JSONResponse:
+    username = str(payload.get("username", "")).strip()
+    if not auth_mod.verify(username, str(payload.get("password", ""))):
+        raise HTTPException(401, "用户名或密码不对")
+    return JSONResponse({"token": auth_mod.create_token(username), "username": username})
+
+
+@app.get("/api/me")
+def api_me(user: str = Depends(current_user)) -> JSONResponse:
+    return JSONResponse({"user": user, "auth_required": auth_mod.auth_required()})
+
+
 @app.get("/api/runs")
-def api_runs() -> JSONResponse:
+def api_runs(user: str = Depends(current_user)) -> JSONResponse:
     return JSONResponse({"runs": _store().list_runs()})
 
 
 @app.post("/api/runs")
-def api_create(payload: dict = Body(...)) -> JSONResponse:
+def api_create(payload: dict = Body(...), user: str = Depends(current_user)) -> JSONResponse:
     topic = str(payload.get("topic", "")).strip()
     if not topic:
         raise HTTPException(400, "topic 不能为空")
@@ -474,7 +520,7 @@ def api_create(payload: dict = Body(...)) -> JSONResponse:
 
 
 @app.get("/api/runs/{run_id}")
-def api_run(run_id: str) -> JSONResponse:
+def api_run(run_id: str, user: str = Depends(current_user)) -> JSONResponse:
     store = _store()
     run = store.get_run(run_id)
     if run is None:
@@ -500,11 +546,12 @@ def _resume_api(run_id: str, answer: dict, *, after_done: bool = False) -> JSONR
     before = usage_snapshot()
     try:
         with session(run_id, db=db) as (app, tid):
-            state = resume(app, answer, tid)
+            state = graph_resume(app, answer, tid)
         store.sync(state, run_id=run_id, db=db, mode=_model(),
                    usage=usage_delta(before, usage_snapshot()))
         if after_done and state.get("image_urls"):
             write_markdown(state, _out_dir())
+            write_publish(state, _out_dir())
     except Exception as exc:  # noqa: BLE001
         store.sync({"topic_direction": run["topic"], "trace": []}, run_id=run_id, db=db,
                    mode=run["mode"], error=f"{type(exc).__name__}: {exc}")
@@ -518,7 +565,7 @@ def _resume_api(run_id: str, answer: dict, *, after_done: bool = False) -> JSONR
 
 
 @app.post("/api/runs/{run_id}/select")
-def api_select(run_id: str, payload: dict = Body(...)) -> JSONResponse:
+def api_select(run_id: str, payload: dict = Body(...), user: str = Depends(current_user)) -> JSONResponse:
     topic = str(payload.get("selected_topic", "")).strip()
     if not topic:
         raise HTTPException(400, "selected_topic 不能为空")
@@ -526,12 +573,49 @@ def api_select(run_id: str, payload: dict = Body(...)) -> JSONResponse:
 
 
 @app.post("/api/runs/{run_id}/review")
-def api_review(run_id: str, payload: dict = Body(...)) -> JSONResponse:
+def api_review(run_id: str, payload: dict = Body(...), user: str = Depends(current_user)) -> JSONResponse:
     decision = str(payload.get("decision", "approve")).strip().lower()
     if decision not in {"approve", "reject"}:
         raise HTTPException(400, "decision 只能是 approve / reject")
     note = str(payload.get("note", "")).strip()
     return _resume_api(run_id, {"decision": decision, "feedback": note}, after_done=True)
+
+
+@app.get("/api/runs/{run_id}/history")
+def api_history(run_id: str, user: str = Depends(current_user)) -> JSONResponse:
+    """时间旅行的入口：列出这条会话的每个检查点（新的在前）。"""
+    run = _store().get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "没有这条运行")
+    db = run["db"] or str(_db_path())
+    with session(run_id, db=db) as (app, tid):
+        rows = graph_history(app, tid)
+    return JSONResponse({"history": rows})
+
+
+@app.post("/api/runs/{run_id}/rewind")
+def api_rewind(run_id: str, payload: dict = Body(...), user: str = Depends(current_user)) -> JSONResponse:
+    """回到指定检查点，从那里重新跑（打回重试 / 换选题重来都靠它）。"""
+    checkpoint_id = str(payload.get("checkpoint_id", "")).strip()
+    if not checkpoint_id:
+        raise HTTPException(400, "checkpoint_id 不能为空")
+
+    store = _store()
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "没有这条运行")
+
+    db = run["db"] or str(_db_path())
+    before = usage_snapshot()
+    try:
+        with session(run_id, db=db) as (app, tid):
+            state = graph_rewind(app, tid, checkpoint_id, str(payload.get("checkpoint_ns", "")))
+        store.sync(state, run_id=run_id, db=db, mode=_model(),
+                   usage=usage_delta(before, usage_snapshot()))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"{type(exc).__name__}: {exc}") from exc
+
+    return JSONResponse({"ok": True, "status": store.get_run(run_id)["status"]})
 
 
 # --------------------------------------------------------------------------- #
@@ -556,29 +640,114 @@ def stream_run(topic: str = "") -> StreamingResponse:
     run_id = f"run-{uuid.uuid4().hex[:8]}"
 
     def gen() -> Iterator[str]:
+        """图在子线程里跑，token 通过队列回到这个生成器 —— 这样才是真流式。
+
+        为什么要线程：`app.stream()` 是同步生成器，而节点的 `stream_complete()`
+        也是同步迭代；直接在异步生成器里跑会卡住事件循环。
+        """
+        q: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         yield _sse("init", {"run_id": run_id, "topic": topic, "model": _model()})
-        try:
-            with session(run_id, db=db) as (app, tid):
-                config = config_for(tid)
-                for chunk in app.stream(initial_input(topic), config, stream_mode="updates"):
-                    for node, update in (chunk or {}).items():
-                        if node == "__interrupt__":
-                            packet = getattr(update[0], "value", None) if update else None
-                            yield _sse("interrupt", {"payload": packet})
-                            continue
-                        events = (update or {}).get("trace", []) if isinstance(update, dict) else []
-                        yield _sse("node", {"node": node, "trace": events})
-                snap = app.get_state(config)
-                state = dict(snap.values or {})
-                if snap.interrupts:
-                    state["__interrupt__"] = tuple(snap.interrupts)
-            store.sync(state, run_id=run_id, db=db, mode=_model())
-            row = store.get_run(run_id) or {}
-            yield _sse("done", {"run_id": run_id, "status": row.get("status", "unknown")})
-        except Exception as exc:  # noqa: BLE001
-            store.sync({"topic_direction": topic, "trace": []}, run_id=run_id, db=db,
-                       mode=_model(), error=f"{type(exc).__name__}: {exc}")
-            yield _sse("error", {"message": f"{type(exc).__name__}: {exc}"})
+
+        def work() -> None:
+            try:
+                with session(run_id, db=db) as (app, tid):
+                    config = config_for(tid)
+                    with token_sink(lambda chunk: q.put(("llm_token", chunk))):
+                        for chunk in app.stream(initial_input(topic), config, stream_mode="updates"):
+                            for node, update in (chunk or {}).items():
+                                if node == "__interrupt__":
+                                    packet = getattr(update[0], "value", None) if update else None
+                                    q.put(("interrupt", {"payload": packet}))
+                                    continue
+                                events = (update or {}).get("trace", []) if isinstance(update, dict) else []
+                                q.put(("node", {"node": node, "trace": events}))
+                    snap = app.get_state(config)
+                    state = dict(snap.values or {})
+                    if snap.interrupts:
+                        state["__interrupt__"] = tuple(snap.interrupts)
+                store.sync(state, run_id=run_id, db=db, mode=_model())
+                row = store.get_run(run_id) or {}
+                q.put(("done", {"run_id": run_id, "status": row.get("status", "unknown")}))
+            except Exception as exc:  # noqa: BLE001
+                store.sync({"topic_direction": topic, "trace": []}, run_id=run_id, db=db,
+                           mode=_model(), error=f"{type(exc).__name__}: {exc}")
+                q.put(("error", {"message": f"{type(exc).__name__}: {exc}"}))
+            finally:
+                q.put(("__end__", None))
+
+        threading.Thread(target=work, daemon=True).start()
+
+        while True:
+            kind, data = q.get()
+            if kind == "__end__":
+                break
+            yield _sse(kind, data)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+@app.get("/stream/resume/{run_id}")
+def stream_resume(run_id: str, action: str = "select", value: str = "", note: str = "") -> StreamingResponse:
+    """流式推进下一步：选题或审稿。
+
+    写稿那一步会把 LLM 的 token 逐个推给前端（`llm_token` 事件）——
+    这是「token 级流式」，不是只推节点。
+    """
+    store = _store()
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "没有这条运行")
+
+    db = run["db"] or str(_db_path())
+    if action == "select":
+        answer: Any = {"selected_topic": value or "1"}
+    else:
+        answer = {"decision": value or "approve", "feedback": note}
+
+    def gen() -> Iterator[str]:
+        q: "queue.Queue[tuple[str, Any]]" = queue.Queue()
+        yield _sse("init", {"run_id": run_id, "action": action})
+
+        def work() -> None:
+            try:
+                with session(run_id, db=db) as (app, tid):
+                    config = config_for(tid)
+                    with token_sink(lambda chunk: q.put(("llm_token", chunk))):
+                        for chunk in app.stream(Command(resume=answer), config, stream_mode="updates"):
+                            for node, update in (chunk or {}).items():
+                                if node == "__interrupt__":
+                                    packet = getattr(update[0], "value", None) if update else None
+                                    q.put(("interrupt", {"payload": packet}))
+                                    continue
+                                events = (update or {}).get("trace", []) if isinstance(update, dict) else []
+                                q.put(("node", {"node": node, "trace": events}))
+                    snap = app.get_state(config)
+                    state = dict(snap.values or {})
+                    if snap.interrupts:
+                        state["__interrupt__"] = tuple(snap.interrupts)
+                store.sync(state, run_id=run_id, db=db, mode=_model(),
+                           usage=usage_delta(before_state, usage_snapshot()))
+                if state.get("image_urls"):
+                    write_markdown(state, _out_dir())
+                    write_publish(state, _out_dir())
+                row = store.get_run(run_id) or {}
+                q.put(("done", {"status": row.get("status", "unknown")}))
+            except Exception as exc:  # noqa: BLE001
+                q.put(("error", {"message": f"{type(exc).__name__}: {exc}"}))
+            finally:
+                q.put(("__end__", None))
+
+        before_state = usage_snapshot()
+        threading.Thread(target=work, daemon=True).start()
+        while True:
+            kind, data = q.get()
+            if kind == "__end__":
+                break
+            yield _sse(kind, data)
 
     return StreamingResponse(
         gen(),

@@ -29,6 +29,7 @@ createApp({
     const note = ref("");
     const busy = ref(false);
     const error = ref("");
+    const streaming = ref("");       // 写稿时逐 token 拼起来的草稿
     let timer = null;
 
     const badge = (s) => BADGE[s] || ["", s];
@@ -91,16 +92,37 @@ createApp({
 
     async function selectTopic(option) {
       if (busy.value) return;
-      busy.value = true; error.value = "";
+      busy.value = true; error.value = ""; streaming.value = "";
+      const id = current.value.run.run_id;
+      // 选题之后就是写稿 —— 走 SSE，能一个字一个字看到稿子长出来
+      const url = `/stream/resume/${id}?action=select&value=${encodeURIComponent(option)}`;
       try {
-        await api(`/api/runs/${current.value.run.run_id}/select`, {
-          method: "POST",
-          body: JSON.stringify({ selected_topic: option }),
+        await new Promise((resolve, reject) => {
+          const es = new EventSource(url);
+          es.onmessage = (ev) => {
+            let frame = null;
+            try { frame = JSON.parse(ev.data); } catch (e) { return; }
+            if (frame.type === "llm_token") streaming.value += frame.data;
+            if (frame.type === "done") { es.close(); resolve(); }
+            if (frame.type === "error") { es.close(); reject(new Error(frame.data.message)); }
+          };
+          es.onerror = () => { es.close(); reject(new Error("流式连接断了")); };
         });
-        await openRun(current.value.run.run_id);
+        await openRun(id);
         await loadRuns();
-      } catch (e) { error.value = String(e.message || e); }
-      finally { busy.value = false; }
+      } catch (e) {
+        // SSE 不可用就退回普通请求，功能不能丢
+        try {
+          await api(`/api/runs/${id}/select`, {
+            method: "POST", body: JSON.stringify({ selected_topic: option }),
+          });
+          await openRun(id);
+          await loadRuns();
+        } catch (e2) { error.value = String(e2.message || e2); }
+      } finally {
+        streaming.value = "";
+        busy.value = false;
+      }
     }
 
     async function review(decision) {
@@ -136,7 +158,7 @@ createApp({
     const fmtMs = (ms) => (ms >= 1000 ? (ms / 1000).toFixed(1) + "s" : ms + "ms");
 
     return {
-      runs, current, topic, note, busy, error, done, activeStep,
+      runs, current, topic, note, busy, error, streaming, done, activeStep,
       STEPS, badge, fmtMs, openRun, createRun, selectTopic, review, loadRuns,
     };
   },
@@ -195,6 +217,11 @@ createApp({
           <div><b>事件</b>{{ current.events.length }} 条</div>
           <div><b>运行 id</b><span class="mono">{{ current.run.run_id }}</span></div>
         </div>
+      </div>
+
+      <div v-if="streaming" class="card" style="margin-top:16px">
+        <div class="sub" style="margin:0 0 8px">正在写…（token 级流式）</div>
+        <pre>{{ streaming }}</pre>
       </div>
 
       <!-- 第 1 步：选题 -->

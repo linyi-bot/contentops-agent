@@ -198,7 +198,29 @@ IMAGE_BASE_URL=https://<你的中转站>
 
 ---
 
-## 十、已知限制（写在明处）
+## 十、工程纵深（阶段 8）
+
+课程 PDF 里列了 8 条「工程纵深」，这一版全部补齐：
+
+| PDF 里的 | 落在这里 | 证据 |
+|---|---|---|
+| 子图 SubGraph | `graph.py` 里三张独立编译的子图（选题 / 写作 / 配图），主图编排它们 | `build_topics_subgraph()` 等 |
+| 结构化输出 | `schemas.py`（Pydantic）+ `llm.complete_json()`（JSON Mode）；失败退回文本解析 | `test_structured_topics` |
+| 历史 / 时间旅行 | `graph.history()` / `graph.rewind()`；CLI `contentops history` / `rewind`；API `/api/runs/{id}/history`、`/rewind` | `test_history_and_rewind` |
+| token 级流式 | `llm.stream_complete()` + 节点里的 `token_sink`；`GET /stream/resume/{id}` 逐个推 `llm_token` | `test_stream_emits_llm_tokens` |
+| JWT 鉴权 | `auth.py`（手写 HS256 + PBKDF2 用户库）；`CONTENTOPS_AUTH=on` 时 `/api/*` 要 Bearer token | `test_api_requires_token` |
+| 双平台发布 | `publish` 节点出「小红书短文案 + 图集」「公众号长文」两版；`write_publish()` 落盘 | `test_write_publish_two_platforms` |
+| 多模型路由 | `build_llm("cheap"/"smart")`：选题图点走小模型，正式稿走旗舰 | `test_model_routing_by_role` |
+| 出图超时重试 | 指数退避 1s→2s→4s，最多次数 `IMAGE_RETRIES`；失败只记 `image_errors` | `test_seedream_retries_then_succeeds` |
+
+两个实现上的取舍，面试也常被问：
+
+1. **子图没直接挂在主图上**：直接把 `CompiledStateGraph` 当节点挂，每次 resume 主图会把子图连同上游重放一遍，`operator.add` 的 trace 会重复累加。所以包了一层 `_run_subgraph()`，只回传增量 —— 子图仍独立编译、可单测，但不参与父图的 checkpoint 语义。
+2. **时间旅行靠 config 里的 `checkpoint_id`**：`update_state(cfg, {})` 在该检查点开一条新分支，再 `invoke(None, cfg)` 往下跑。`update_state()` 没有 `checkpoint_id` 参数，别照着旧文档写。
+
+---
+
+## 十一、已知限制（写在明处）
 
 - **token 级流式没做**：SSE 只推节点级（`stream_mode="updates"`）；token 级要 LLM 客户端先接流式。
 - **旧评测集退役了**：黄金集评测跟的是「检索+事实核查」那套流程，流程换掉后暂不可用，
@@ -212,6 +234,7 @@ IMAGE_BASE_URL=https://<你的中转站>
 
 | 版本 | 变更 |
 |---|---|
+| 0.6.0 | 工程纵深补齐：子图、结构化输出、时间旅行、token 级流式、JWT、双平台发布、多模型路由、出图重试（68 passed） |
 | 0.5.0 | 换成「自媒体运营」六节点流程：两次 `interrupt`、并行出图、Vue3 前端、三种 checkpointer |
 | 0.4.0 | 事实核查回写环 + 30 条黄金集评测（已随流程退役） |
 | 0.3.0 | trace 落库 + 页面 + 打包 |

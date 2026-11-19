@@ -27,6 +27,7 @@ mock 不是「随便回一句话」：它会真的读检索结果里 `[n] 出自
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import threading
@@ -267,6 +268,10 @@ class LLM(Protocol):
 
     def complete(self, system: str, user: str, max_tokens: int = 800) -> str: ...
 
+    def complete_json(self, system: str, user: str, schema: Any, max_tokens: int = 800) -> Any: ...
+
+    def stream_complete(self, system: str, user: str, max_tokens: int = 800): ...
+
 
 def _first_sentence(text: str, limit: int = 46) -> str:
     """从一段 markdown 里摘一句干净的话，够 mock 用即可。"""
@@ -379,6 +384,37 @@ class MockLLM:
         m = re.search(r"(?:方向|选题)[：:]\s*(.+)", user or "")
         return (m.group(1).strip().splitlines()[0] if m else "这个方向")[:24]
 
+    def complete_json(self, system: str, user: str, schema: Any, max_tokens: int = 800) -> Any:
+        """结构化输出（mock 也照 schema 给，测试才能断言「解析这一层」也在工作）。"""
+        direction = self._direction(user)
+        if "图点" in system or "配图" in system:
+            payload = {
+                "points": [
+                    "痛点：信息散落，收集最耗时",
+                    "方法：先归并原始信息",
+                    "步骤：三步跑通一条流水线",
+                    "结论：人只做判断与措辞",
+                ]
+            }
+        else:
+            payload = {
+                "topics": [
+                    f"{direction}：先搞清这 3 个概念",
+                    f"用 {direction} 做一个最小实验",
+                    f"{direction} 最容易踩的 3 个坑",
+                    f"两种方案怎么选：{direction} 对比",
+                    f"一个真实场景：{direction} 落地",
+                ]
+            }
+        return schema.model_validate(payload)
+
+    def stream_complete(self, system: str, user: str, max_tokens: int = 800):
+        """逐块吐字 —— 给 SSE 的 `llm_token` 事件用。"""
+        text = self.complete(system, user, max_tokens)
+        for i in range(0, len(text), 12):
+            time.sleep(0.005)
+            yield text[i : i + 12]
+
 
 # --------------------------------------------------------------------------- #
 # 真模型：OpenAI 兼容 /chat/completions
@@ -457,6 +493,61 @@ class OpenAICompatLLM:
 
         self._record(data.get("usage") or {}, latency)
         return content
+
+    def complete_json(self, system: str, user: str, schema: Any, max_tokens: int = 800) -> Any:
+        """JSON Mode + Pydantic 校验。
+
+        为什么不用 `with_structured_output`：它返回的是解析后的对象，拿不到
+        `usage`（课程 P50 踩过同一个坑）。这里自己拿原始响应，既能统计 token，
+        又能拿到「模型到底回了什么」用于报错。
+        """
+        body = self.payload(system, user, max_tokens)
+        body["response_format"] = {"type": "json_object"}
+        t0 = time.perf_counter()
+        data = self._request(body)
+        latency = int((time.perf_counter() - t0) * 1000)
+
+        try:
+            content = (data["choices"][0]["message"].get("content") or "").strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"响应结构不认识：{str(data)[:200]}") from exc
+        self._record(data.get("usage") or {}, latency)
+
+        try:
+            payload = json.loads(content)
+        except ValueError:
+            # 有的中转会把 JSON 包在 ```json 里，兜一层
+            m = re.search(r"\{.*\}", content, re.S)
+            if not m:
+                raise LLMError(f"模型没回 JSON：{content[:200]}") from None
+            payload = json.loads(m.group(0))
+        return schema.model_validate(payload)
+
+    def stream_complete(self, system: str, user: str, max_tokens: int = 800):
+        """真流式：读 chat/completions 的 SSE，逐 delta 吐字。"""
+        body = self.payload(system, user, max_tokens)
+        body["stream"] = True
+        url = f"{self._base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        with httpx.stream("POST", url, headers=headers, json=body, timeout=self._timeout) as resp:
+            if resp.status_code != 200:
+                raise LLMError(f"流式请求失败 HTTP {resp.status_code}")
+            for line in resp.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                chunk = line[6:].strip()
+                if chunk == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(chunk)
+                except ValueError:
+                    continue
+                delta = ((obj.get("choices") or [{}])[0].get("delta") or {}).get("content")
+                if delta:
+                    yield delta
 
     def _record(self, usage: dict[str, Any], latency_ms: int) -> None:
         hit = int(usage.get("prompt_cache_hit_tokens") or 0)
@@ -587,8 +678,25 @@ def _client(
     )
 
 
-def build_llm() -> LLM:
-    """按环境变量选模型；没有 key 就回落 mock，绝不因为缺 key 而崩。"""
+def _model_for(role: str) -> str:
+    """按角色挑模型：便宜活（选题、图点）走小模型，正式稿走旗舰。
+
+    三个环境变量的优先级：
+    `LLM_MODEL_CHEAP` / `LLM_MODEL_SMART` > `LLM_MODEL` > 默认值。
+    """
+    base = os.getenv("LLM_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    if role == "cheap":
+        return os.getenv("LLM_MODEL_CHEAP", "").strip() or base
+    if role == "smart":
+        return os.getenv("LLM_MODEL_SMART", "").strip() or base
+    return base
+
+
+def build_llm(role: str = "default") -> LLM:
+    """按环境变量选模型；没有 key 就回落 mock，绝不因为缺 key 而崩。
+
+    `role`: `cheap`（选题/图点）/ `smart`（写稿）/ `default`。
+    """
     load_dotenv()  # 让「复制 .env.example 成 .env 再跑」真的生效
     provider = os.getenv("LLM_PROVIDER", "mock").strip().lower()
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -598,7 +706,7 @@ def build_llm() -> LLM:
             provider,
             api_key,
             os.getenv("LLM_BASE_URL", DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL,
-            os.getenv("LLM_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+            _model_for(role),
             _env_float("LLM_TIMEOUT", 60.0),
             int(_env_float("LLM_RETRIES", 2)),
             _flag("LLM_THINKING", False),

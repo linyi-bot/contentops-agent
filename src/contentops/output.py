@@ -62,3 +62,31 @@ def write_markdown(state: ArticleState, out_dir: str | Path) -> Path:
     path = directory / f"{slug_for(title)}.md"
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+def write_publish(state: ArticleState, out_dir: str | Path) -> list[Path]:
+    """把双平台版本各落一份：`publish/xiaohongshu/<slug>.md` 与 `publish/wechat/<slug>.md`。
+
+    没有 `published` 就不写（比如打回次数用尽的那条），免得留下空壳文件。
+    """
+    published = state.get("published") or {}
+    if not published:
+        return []
+
+    root = Path(out_dir) / "publish"
+    written: list[Path] = []
+    for platform in ("xiaohongshu", "wechat"):
+        payload = published.get(platform) or {}
+        title = str(payload.get("title") or "untitled")
+        directory = root / platform
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{slug_for(title)}.md"
+        lines = [f"# {title}", "", str(payload.get("body") or "")]
+        images = payload.get("images") or []
+        if images:
+            lines += ["", "## 配图"]
+            lines += [f"{i}. {img}" for i, img in enumerate(images, start=1)]
+        lines += ["", "---", f"平台：{platform}　导出：{published.get('published_at', '')}"]
+        path.write_text("\n".join(lines), encoding="utf-8")
+        written.append(path)
+    return written

@@ -78,7 +78,8 @@ def test_stream_pushes_nodes_then_interrupt(client, work):
     assert types[0] == "init"
     assert types[-1] == "done"
     assert "interrupt" in types
-    assert [f["data"]["node"] for f in frames if f["type"] == "node"] == ["plan_topics"]
+    # 主图里这一格是子图节点（topics_sub），子图内部仍记 plan_topics 的 trace
+    assert [f["data"]["node"] for f in frames if f["type"] == "node"] == ["topics_sub"]
 
     run_id = frames[0]["data"]["run_id"]
     assert frames[-1]["data"]["status"] == "paused"
