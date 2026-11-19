@@ -298,7 +298,12 @@ def _parse_context(user: str) -> list[tuple[int, str, str, str]]:
 
 
 class MockLLM:
-    """确定性假模型：不需要 key，输出可预测，用于跑通链路和写测试。"""
+    """确定性假模型：不需要 key，输出可预测，用于跑通链路和写测试。
+
+    它会看 system 提示词在问什么，分别给出「选题清单 / 正文 / 图点」三种形状 ——
+    项目二的三个节点都要解析结构，mock 如果只会说一句占位话，测试就变成
+    在测解析器的容错，而不是测流程。
+    """
 
     name = "mock"
 
@@ -306,6 +311,52 @@ class MockLLM:
         # 用输入哈希保证「同样的输入得到同样的输出」，测试才能断言
         digest = hashlib.sha256((system + user).encode("utf-8")).hexdigest()[:8]
         time.sleep(0.01)  # 模拟一点耗时，让 trace 里的耗时字段有值
+
+        direction = self._direction(user)
+
+        if "选题" in system:
+            return "\n".join(
+                f"{i}. {t}"
+                for i, t in enumerate(
+                    [
+                        f"{direction}：先搞清这 3 个概念",
+                        f"用 {direction} 做一个最小实验",
+                        f"{direction} 最容易踩的 3 个坑",
+                        f"两种方案怎么选：{direction} 对比",
+                        f"一个真实场景：{direction} 落地",
+                    ],
+                    start=1,
+                )
+            )
+
+        if "图点" in system or "配图" in system:
+            return "\n".join(
+                [
+                    "1. 痛点：信息散落，收集最耗时",
+                    "2. 方法：先归并原始信息",
+                    "3. 步骤：三步跑通一条流水线",
+                    "4. 结论：人只做判断与措辞",
+                ]
+            )
+
+        if "文案" in system or "正文" in system or "写" in system:
+            revised = "修改意见" in user
+            head = ""
+            if revised:
+                m = re.search(r"修改意见[^：:]*[：:]\s*(.+)", user)
+                head = f"（按意见修改：{(m.group(1).strip() if m else '已调整')[:20]}）\n"
+            return (
+                head
+                + f"[mock:{digest}] 一、先说结论\n"
+                f"{direction} 值得做的原因只有一个：把重复劳动交给机器，"
+                f"人只保留判断。多数团队的问题不是不会写，而是每条信息都要人工归并一遍。\n\n"
+                f"二、怎么做\n"
+                f"把原始材料先归并成「事实清单」，再让模型按清单出稿，最后人工只改措辞和判断。"
+                f"这样模型没有机会编，因为它的输入里只有已经确认过的事实。\n\n"
+                f"三、马上能做的\n"
+                f"下一次写周报前，先把散落的信息贴进一个文件，再让模型做归并。"
+                f"先跑通这一小步，比一次性上全套流程有用。"
+            )
 
         docs = _parse_context(user)
         if docs:
@@ -322,6 +373,11 @@ class MockLLM:
             f"输入长度 system={len(system)} user={len(user)}，"
             f"如果换成真模型，这里会是真实内容。"
         )
+
+    @staticmethod
+    def _direction(user: str) -> str:
+        m = re.search(r"(?:方向|选题)[：:]\s*(.+)", user or "")
+        return (m.group(1).strip().splitlines()[0] if m else "这个方向")[:24]
 
 
 # --------------------------------------------------------------------------- #

@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .state import ContentState
+from .state import ArticleState
 
 #: 默认落盘位置（相对当前目录）。和 checkpointer 分开放：一个存图状态，一个存轨迹。
 DEFAULT_TRACE_DB = Path(".contentops") / "traces.sqlite"
@@ -69,14 +69,20 @@ def resolve_trace_db(explicit: str | os.PathLike[str] | None = None) -> Path:
     return path
 
 
-def status_of(state: ContentState, error: str = "") -> str:
-    """把一次调用的结果翻译成一个状态词 —— 页面上那枚标签就是它。"""
+def status_of(state: Any, error: str = "") -> str:
+    """把一次调用的结果翻译成一个状态词 —— 页面上那枚标签就是它。
+
+    项目二的终局是「出完图」，所以判定顺序是：
+    出错 > 停在中断 > 有图（完成）> 其它（没走到头，算 ended）。
+    """
     if error:
         return "error"
     if state.get("__interrupt__"):
         return "paused"
-    if state.get("published"):
-        return "published"
+    if state.get("image_urls"):
+        return "completed"
+    if state.get("status") == "done":
+        return "completed"
     return "ended"
 
 
@@ -102,7 +108,7 @@ class TraceStore:
 
     def sync(
         self,
-        state: ContentState,
+        state: ArticleState,
         *,
         run_id: str | None = None,
         mode: str = "",
@@ -172,9 +178,9 @@ class TraceStore:
             if state.get("review_decision"):
                 sets.append("decision=?")
                 args.append(str(state["review_decision"]))
-            if state.get("review_note"):
+            if state.get("review_feedback"):
                 sets.append("review_note=?")
-                args.append(str(state["review_note"]))
+                args.append(str(state["review_feedback"]))
             if error:
                 sets.append("error=?")
                 args.append(error)

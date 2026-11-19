@@ -1,302 +1,335 @@
-"""节点实现。
+"""节点实现 —— 项目二（自媒体运营 AI 智能体）版。
 
 约定：
-- 每个节点是纯函数 `(state) -> partial_state`，不读写全局、不做 IO 副作用外的隐式事；
-- 每个节点都往 `trace` 里追加一条，包含耗时和一句人话说明；
-- 节点内部失败要「降级而不崩」，把错误写进 trace，让流水线继续走。
+- 每个节点是纯函数 `(state) -> partial_state`，副作用只有一次外部调用（LLM / 出图）；
+- 每个节点都往 `trace` 与 `node_metrics` 里各追加一条，耗时同源；
+- 节点内部失败要「降级而不崩」：LLM 挂了就出一版说明性的稿子，
+  出图挂了就把错误收进 `image_errors`，流程继续走 —— 页面要能看到失败，而不是 500。
 
-阶段 2 新增三个节点：
-- `factcheck`：把草稿切成断言，逐条查「引用有没有落地」，不过的写进 `unchecked`；
-- `review`：`interrupt()` 暂停，把审核包推给人，等人回放行 / 打回；
-- `publish`：组装发布记录（不写盘 —— 落盘是 CLI 的事，节点保持纯粹可测）。
+六个节点：
+    plan_topics      出 3-5 个选题
+    human_select     中断 #1，等人挑一个
+    write_draft      按选题写长文（打回时带意见重写）
+    human_review     中断 #2，等人放行 / 打回
+    extract_visuals  把正文提炼成 3-5 个图点
+    generate_images  并行出图（同步 API 丢线程池）
 """
 from __future__ import annotations
 
-import os
 import re
 import time
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
+from .image_service import build_image_service
 from .llm import LLM, build_llm, usage_snapshot
-from .retriever import Retriever
-from .state import Claim, ContentState, Hit, ReviewPacket, TraceEvent
+from .state import (
+    ArticleState,
+    NodeMetric,
+    ReviewPacket,
+    SelectPacket,
+    TraceEvent,
+)
 
-_RETRIEVER: Retriever | None = None
-
-
-def get_retriever() -> Retriever:
-    global _RETRIEVER
-    if _RETRIEVER is None:
-        _RETRIEVER = Retriever()
-    return _RETRIEVER
-
-
-#: 相关度闸门的默认阈值。来源：30 条黄金集里「应答题最低分 0.128」与
-#: 「应拒答题最高分 0.082」之间，取偏保守的 0.09。这是**在这批样本上校准**
-#: 的数，换知识库、换语料规模都要重标 —— 别把它当常数。
-#: `RETRIEVAL_MIN_SCORE=0` 可以关掉闸门跑基线对照。
-#: 已知局限：分数按查询词累加，超短查询（如单个「周报」）天然分低，会被误拒。
-DEFAULT_MIN_SCORE = "0.09"
+# --------------------------------------------------------------------------- #
+# 公共小工具
+# --------------------------------------------------------------------------- #
 
 
-def min_score() -> float:
-    """当前生效的相关度阈值；每次调用都读环境变量，评测才能在一次进程里跑两种口径。"""
-    raw = os.getenv("RETRIEVAL_MIN_SCORE", DEFAULT_MIN_SCORE).strip()
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return float(DEFAULT_MIN_SCORE)
+def _finish(node: str, t0: float, note: str, *, tokens: int = 0, model: str = "") -> dict:
+    """节点的统一收尾：一条时间线 + 一条成本记录，ms 只算一次。"""
+    ms = int((time.perf_counter() - t0) * 1000)
+    return {
+        "trace": [TraceEvent(node=node, ms=ms, note=note)],
+        "node_metrics": [NodeMetric(node=node, ms=ms, tokens=tokens, model=model)],
+    }
 
 
-def _event(node: str, t0: float, note: str) -> TraceEvent:
-    return TraceEvent(node=node, ms=int((time.perf_counter() - t0) * 1000), note=note)
+_NUM_LINE = re.compile(r"^\s*(?:\d{1,2}\s*[.、)．]|[-*·])\s*(.+?)\s*$")
 
 
-DRAFT_SYSTEM = """你是一名内容运营。根据给定资料写一段 200 字以内的中文初稿。
+def _numbered_lines(text: str, limit: int = 6) -> list[str]:
+    """把模型输出里的编号行抽出来。
+
+    模型很爱加「好的，以下是选题：」这种开场白，也可能用 markdown 列表，
+    所以不按行号解析，只认「编号/圆点 + 内容」，其余行丢掉。
+    """
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        m = _NUM_LINE.match(line.strip())
+        if not m:
+            continue
+        item = re.sub(r"^[*#\s]+", "", m.group(1)).strip(" 　。；;")
+        if len(item) >= 2:
+            out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _clean(text: str) -> str:
+    return re.sub(r"^\[mock:[0-9a-fA-F]{6,}\]\s*", "", (text or "").strip())
+
+
+# --------------------------------------------------------------------------- #
+# 提示词
+# --------------------------------------------------------------------------- #
+
+TOPIC_SYSTEM = """你是小红书内容策划，服务一家做 AI 编程培训的教育公司。
+根据给定方向，出 5 个「技术干货型」选题。
 硬规则：
-1. 只能使用资料中出现的事实，资料没写的不要编；
-2. 每条事实后面用 [1] [2] 标注它来自第几条资料；
-3. 输出纯文本，不要 markdown 标题。"""
+1. 每行一个，格式必须是「1. 标题」，不要任何开场白和解释；
+2. 标题 12-20 字，带具体收益或反差，不要标题党；
+3. 5 个选题角度要不同（工具、方法、踩坑、对比、案例）。"""
+
+DRAFT_SYSTEM = """你是内容运营，写一篇中文技术干货短文，发布在小红书。
+硬规则：
+1. 500 字以内，分 3 段，每段一个小标题（用「一、二、三、」开头）；
+2. 口语化，讲人话，不堆术语；不虚构数据、不编造案例；
+3. 结尾给一句可执行的建议；
+4. 只输出正文，不要解释你写了什么。"""
+
+VISUAL_SYSTEM = """你是视觉编辑，把一篇小红书文案拆成配图脚本。
+硬规则：
+1. 出 4 个图点，每行一个，格式必须是「1. 描述」；
+2. 每个描述 10-16 字，是一张图要表达的内容（不是标题重复）；
+3. 4 个图点覆盖：痛点、方法、步骤、结论；不要任何解释。"""
 
 
-def retrieve_node(state: ContentState) -> dict:
+# --------------------------------------------------------------------------- #
+# 1. 出选题
+# --------------------------------------------------------------------------- #
+
+
+def plan_topics_node(state: ArticleState) -> dict:
     t0 = time.perf_counter()
-    topic = state.get("topic", "").strip()
-    if not topic:
-        return {"hits": [], "trace": [_event("retrieve", t0, "无选题，跳过检索")]}
-
-    found: list[Hit] = get_retriever().search(topic, top_k=3)
-    threshold = min_score()
-    hits = [h for h in found if h["score"] >= threshold] if threshold > 0 else found
-
-    if found and not hits:
-        note = (
-            f"最高分 {found[0]['score']:.3f} 低于相关度阈值 {threshold:.2f}，"
-            "按「知识库无相关资料」处理（不拿不相关的资料硬凑草稿）"
-        )
-    elif hits:
-        note = f"命中 {len(hits)} 条，最高分 {hits[0]['score']:.3f}"
-    else:
-        note = "知识库无命中（草稿阶段会显式说明这一点）"
-    return {"hits": hits, "trace": [_event("retrieve", t0, note)]}
-
-
-def _format_context(hits: list[Hit]) -> str:
-    if not hits:
-        return "（知识库无相关资料）"
-    return "\n\n".join(
-        f"[{i + 1}] 出自《{h['doc']}》{('· ' + h['heading']) if h['heading'] else ''}\n{h['text']}"
-        for i, h in enumerate(hits)
-    )
-
-
-def draft_node(state: ContentState) -> dict:
-    t0 = time.perf_counter()
-    topic = state.get("topic", "")
-    hits = state.get("hits", [])
-    revision = state.get("revision", 0) + 1
+    direction = (state.get("topic_direction") or "").strip()
     llm: LLM = build_llm()
-
-    user = f"选题：{topic}\n\n资料：\n{_format_context(hits)}"
-    unchecked = state.get("unchecked") or []
-    if revision > 1 and unchecked:
-        user += "\n\n上一版被打回的问题（这次别再犯）：\n" + "\n".join(
-            f"- {u}" for u in unchecked[:5]
-        )
 
     before = usage_snapshot()
     try:
-        draft = llm.complete(DRAFT_SYSTEM, user)
-        after = usage_snapshot()
-        spent = (after.prompt_tokens - before.prompt_tokens) + (
-            after.completion_tokens - before.completion_tokens
-        )
-        note = f"第 {revision} 版，模型 {llm.name} 生成 {len(draft)} 字"
+        raw = llm.complete(TOPIC_SYSTEM, f"方向：{direction}\n平台：{state.get('platform', 'xiaohongshu')}",
+                           max_tokens=400)
+        topics = _numbered_lines(raw, limit=5)
+        spent = _delta(before)
+        note = f"模型 {llm.name} 出了 {len(topics)} 个选题"
         if spent:
-            # 真模型才有的信息：这一版烧了多少 token。mock 不打这一行，免得 trace 里全是 0。
             note += f"（{spent} tokens）"
-    except Exception as exc:  # 网络/额度问题不应该让整条流水线死掉
-        draft = f"（生成失败：{type(exc).__name__}: {exc}）\n资料共 {len(hits)} 条，已保留在 trace 中。"
+    except Exception as exc:  # noqa: BLE001 - 模型挂了也要让人能继续选
+        topics = [f"{direction}：一个可以马上用的方法"]
+        spent = 0
+        note = f"选题生成失败已降级：{type(exc).__name__}"
+
+    return {
+        "generated_topics": topics,
+        "status": "topics_generated",
+        **_finish("plan_topics", t0, note, tokens=spent, model=llm.name),
+    }
+
+
+def _delta(before) -> int:
+    after = usage_snapshot()
+    return (after.prompt_tokens - before.prompt_tokens) + (
+        after.completion_tokens - before.completion_tokens
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 2. 中断 #1：人选一个
+# --------------------------------------------------------------------------- #
+
+
+def human_select_node(state: ArticleState) -> dict:
+    """在这里 `interrupt()`：图挂起，进程可以退出，人选完再回来。
+
+    注意 LangGraph 1.0 的语义：恢复时**这个节点会整个重新跑一遍**，
+    上面的代码（构造 packet）会再执行一次，`interrupt()` 这次拿到的是恢复值。
+    所以这里除了「构造 packet」不要有任何副作用。
+    """
+    from langgraph.types import interrupt
+
+    t0 = time.perf_counter()
+    options = list(state.get("generated_topics") or [])
+    packet = SelectPacket(
+        step="select_topic",
+        topic_direction=state.get("topic_direction", ""),
+        options=options,
+    )
+    answer = interrupt(packet)  # ← 图在这里挂起
+
+    picked = _normalize_choice(answer, options)
+
+    return {
+        "selected_topic": picked,
+        "status": "topic_selected",
+        **_finish("human_select", t0, f"选定：{picked}"),
+    }
+
+
+def _normalize_choice(answer: Any, options: list[str]) -> str:
+    """人给的答案可能是 1 基序号、也可能是完整标题。都认。"""
+    if isinstance(answer, dict):
+        answer = answer.get("selected_topic") or answer.get("value") or answer.get("index")
+    text = str(answer or "").strip()
+    if not text:
+        return options[0] if options else ""
+    if text.isdigit():
+        idx = int(text)
+        if 1 <= idx <= len(options):
+            return options[idx - 1]
+    for opt in options:
+        if text == opt or text in opt or opt in text:
+            return opt
+    return text  # 允许自定义：不在候选里也认，页面会显示「自定义选题」
+
+
+# --------------------------------------------------------------------------- #
+# 3. 写正文
+# --------------------------------------------------------------------------- #
+
+
+def write_draft_node(state: ArticleState) -> dict:
+    t0 = time.perf_counter()
+    topic = state.get("selected_topic") or state.get("topic_direction", "")
+    feedback = (state.get("review_feedback") or "").strip()
+    revision = int(state.get("revision") or 0) + 1
+    llm: LLM = build_llm()
+
+    user = f"选题：{topic}"
+    if feedback:
+        user += f"\n\n上一版被打回，修改意见（这次必须改）：\n{feedback}"
+
+    before = usage_snapshot()
+    try:
+        draft = _clean(llm.complete(DRAFT_SYSTEM, user, max_tokens=900))
+        if feedback:
+            draft = draft  # 模型自己参考意见重写；这里不强加标记，避免污染正文
+        spent = _delta(before)
+        note = f"第 {revision} 版，{len(draft)} 字"
+        if feedback:
+            note += "（按意见重写）"
+        if spent:
+            note += f"，{spent} tokens"
+    except Exception as exc:  # noqa: BLE001
+        draft = f"（这一版生成失败：{type(exc).__name__}）\n选题：{topic}"
+        spent = 0
         note = f"第 {revision} 版，模型调用失败已降级：{type(exc).__name__}"
 
-    return {"draft": draft, "revision": revision, "trace": [_event("draft", t0, note)]}
+    return {
+        "article_content": draft,
+        "revision": revision,
+        "status": "draft_generated",
+        **_finish("write_draft", t0, note, tokens=spent, model=llm.name),
+    }
 
 
 # --------------------------------------------------------------------------- #
-# 事实核查
-# --------------------------------------------------------------------------- #
-
-_CITE = re.compile(r"\[(\d{1,2})\]")
-_SENTENCE = re.compile(r"[^。！？!?\n]+[。！？!?]?")
-_CJK = re.compile(r"[\u4e00-\u9fff]")
-_WORD = re.compile(r"[a-zA-Z]{2,}|\d+(?:\.\d+)?%?")
-
-# 模板话术 / 失败占位不是事实断言，不该拿去查引用
-_META_MARKS = ("（生成失败", "占位草稿", "如果换成真模型")
-# mock 模型会在句首打一个 [mock:xxxxxxxx]，那是模型身份而不是内容，先剥掉再判
-_MOCK_TAG = re.compile(r"^\[mock:[0-9a-fA-F]{6,}\]\s*")
-
-# 「的、了、是」这类高频虚词撞上不算证据
-_STOP_CHARS = set("的了和是在有为与及或也就都要会被把从对不这那其之以而并个们着过地得上中时年月日一条每")
-
-
-def _is_meta(sentence: str) -> bool:
-    return any(mark in sentence for mark in _META_MARKS)
-
-
-def _overlap(claim: str, source: str) -> tuple[int, set[str]]:
-    """断言和引用段落共享了多少实字 / 实词 —— 用来抓「引错了段」。"""
-    chars = {c for c in _CJK.findall(claim) if c not in _STOP_CHARS}
-    shared_chars = len(chars & set(_CJK.findall(source)))
-    shared_words = set(_WORD.findall(claim)) & set(_WORD.findall(source))
-    return shared_chars, shared_words
-
-
-def _split_sentences(text: str) -> list[str]:
-    return [m.group(0).strip() for m in _SENTENCE.finditer(text) if m.group(0).strip()]
-
-
-def factcheck_node(state: ContentState) -> dict:
-    """逐条查「这条断言引用的编号，真的指向一段能支撑它的话吗」。
-
-    只做两件可机判的事：
-    1. 断言必须带 `[n]`，且 n 落在本次检索结果的范围内；
-    2. 被引的那段文字里，得能找到这条断言至少 2 个实字或 1 个数字/单词。
-    语义上到底支不支持，机器判不了，留给人工审核 —— 这也是为什么下一个节点是 interrupt。
-    """
-    t0 = time.perf_counter()
-    draft = state.get("draft", "")
-    hits = state.get("hits", [])
-    n = len(hits)
-
-    claims: list[Claim] = []
-    unchecked: list[str] = []
-
-    for sentence in _split_sentences(draft):
-        sentence = _MOCK_TAG.sub("", sentence)
-        if len(sentence) < 8 or _is_meta(sentence):
-            continue
-
-        cites = [int(c) for c in _CITE.findall(sentence)]
-        if not cites:
-            claims.append(Claim(text=sentence, cites=[], supported=False, reason="没有引用标记"))
-            unchecked.append(sentence)
-            continue
-
-        bad = [c for c in cites if c < 1 or c > n]
-        if bad:
-            claims.append(
-                Claim(
-                    text=sentence,
-                    cites=cites,
-                    supported=False,
-                    reason=f"引用编号 {bad} 不存在（本次只检索到 {n} 条资料）",
-                )
-            )
-            unchecked.append(sentence)
-            continue
-
-        sources = " ".join(hits[c - 1]["text"] for c in cites)
-        shared_chars, shared_words = _overlap(sentence, sources)
-        if shared_chars < 2 and not shared_words:
-            claims.append(
-                Claim(
-                    text=sentence,
-                    cites=cites,
-                    supported=False,
-                    reason=f"引用 {'/'.join(f'[{c}]' for c in cites)} 的段落里找不到这条断言的关键词",
-                )
-            )
-            unchecked.append(sentence)
-            continue
-
-        claims.append(
-            Claim(
-                text=sentence,
-                cites=cites,
-                supported=True,
-                reason=f"引用编号有效，与原文共享 {shared_chars} 个实字"
-                + (f"、{len(shared_words)} 个数字/单词" if shared_words else ""),
-            )
-        )
-
-    if not claims:
-        # 一句可核查的断言都没有，等于没有证据链 —— 不能算「通过」，
-        # 必须留一条给人看，否则模型返回空稿也能一路绿灯发出去。
-        reason = "本次检索 0 命中" if n == 0 else "草稿里没有任何可核查的断言"
-        unchecked = [f"{reason}，这份稿子无法用资料支撑，必须人工确认后才能发布"]
-        note = f"没有可核查的断言（{reason}）"
-    else:
-        note = f"{len(claims)} 条断言，{len(unchecked)} 条未通过"
-    return {"claims": claims, "unchecked": unchecked, "trace": [_event("factcheck", t0, note)]}
-
-
-# --------------------------------------------------------------------------- #
-# 人工审核 + 发布
+# 4. 中断 #2：人审
 # --------------------------------------------------------------------------- #
 
 
-def review_node(state: ContentState) -> dict:
-    """在 `interrupt()` 处暂停，等人答复。
-
-    注意：第一次执行到这里时 interrupt 直接抛出，节点下面的代码不跑，
-    所以「review 那条 trace」要等恢复之后才落地 —— 这不是 bug，
-    而是 LangGraph 的语义：节点要么整体提交，要么整体不提交。
-    """
-    from langgraph.types import interrupt  # 延迟导入：没有 checkpointer 的场景也能 import 本模块
+def human_review_node(state: ArticleState) -> dict:
+    """第二次 `interrupt()`：推草稿给人，拿回 approve / reject + 意见。"""
+    from langgraph.types import interrupt
 
     t0 = time.perf_counter()
     packet = ReviewPacket(
-        topic=state.get("topic", ""),
-        draft=state.get("draft", ""),
-        claims=state.get("claims", []),
-        unchecked=state.get("unchecked", []),
-        revision=state.get("revision", 0),
+        step="review",
+        topic=state.get("selected_topic", ""),
+        draft=state.get("article_content", ""),
+        revision=int(state.get("revision") or 0),
+        options=["approve", "reject"],
     )
-    answer = interrupt(packet)  # ← 图在这里挂起，进程可以退出，人第二天再回来
+    answer = interrupt(packet)
 
     if isinstance(answer, dict):
-        raw = str(answer.get("decision", ""))
-        note = str(answer.get("note", "")).strip()
+        raw = str(answer.get("decision", "")).strip().lower()
+        feedback = str(answer.get("feedback") or answer.get("note") or "").strip()
     else:
-        raw, note = str(answer), ""
+        raw, feedback = str(answer).strip().lower(), ""
 
-    approved = raw.strip().lower() in {"approve", "approved", "y", "yes", "ok", "放行", "通过"}
-    unchecked = state.get("unchecked") or []
+    approved = raw in {"approve", "approved", "y", "yes", "ok", "通过", "放行"}
     decision = "approve" if approved else "reject"
-
-    if approved and unchecked:
-        human_note = f"放行（带着 {len(unchecked)} 条未核实断言，审核人已知情）"
-    elif approved:
-        human_note = "放行，断言全部通过"
-    else:
-        human_note = f"打回，退回重写（附言：{note or '无'}）"
+    note = "放行" if approved else f"打回（意见：{feedback or '无'}）"
 
     return {
         "review_decision": decision,
-        "review_note": note,
-        "trace": [_event("review", t0, human_note)],
+        "review_feedback": feedback,
+        "status": "reviewed",
+        **_finish("human_review", t0, note),
     }
 
 
-def publish_node(state: ContentState) -> dict:
-    """组装发布记录。不写盘：落盘由 CLI 负责，节点保持纯粹、可测。"""
+# --------------------------------------------------------------------------- #
+# 5. 提炼图点
+# --------------------------------------------------------------------------- #
+
+
+def extract_visuals_node(state: ArticleState) -> dict:
     t0 = time.perf_counter()
-    hits = state.get("hits", [])
-    unchecked = state.get("unchecked") or []
+    content = state.get("article_content", "")
+    llm: LLM = build_llm()
 
-    published = {
-        "title": state.get("topic", ""),
-        "body": state.get("draft", ""),
-        "sources": [
-            {"index": i + 1, "doc": h["doc"], "heading": h["heading"]}
-            for i, h in enumerate(hits)
-        ],
-        "unchecked": list(unchecked),
-        "revision": state.get("revision", 0),
-        "review_note": state.get("review_note", ""),
-        "gate": "passed" if not unchecked else f"forced（{len(unchecked)} 条未核实，人工放行）",
-        "published_at": datetime.now().isoformat(timespec="seconds"),
+    before = usage_snapshot()
+    try:
+        raw = llm.complete(VISUAL_SYSTEM, f"文案：\n{content}", max_tokens=300)
+        points = _numbered_lines(raw, limit=5) or _fallback_points(content)
+        spent = _delta(before)
+        note = f"提炼出 {len(points)} 个图点"
+        if spent:
+            note += f"（{spent} tokens）"
+    except Exception as exc:  # noqa: BLE001
+        points = _fallback_points(content)
+        spent = 0
+        note = f"提炼失败已降级：{type(exc).__name__}"
+
+    return {
+        "visual_points": points,
+        "status": "visuals_ready",
+        **_finish("extract_visuals", t0, note, tokens=spent, model=llm.name),
     }
-    note = f"发布记录已生成，引用 {len(hits)} 条资料，闸门 {published['gate']}"
-    return {"published": published, "trace": [_event("publish", t0, note)]}
+
+
+def _fallback_points(content: str) -> list[str]:
+    """模型不听话时的兜底：从正文里抽前几句当图点，保证一定能出图。"""
+    sentences = [s.strip() for s in re.split(r"[。！？\n]", content) if len(s.strip()) >= 6]
+    return [s[:16] for s in sentences[:4]] or ["封面：选题价值一句话"]
+
+
+# --------------------------------------------------------------------------- #
+# 6. 并行出图
+# --------------------------------------------------------------------------- #
+
+
+def generate_images_node(state: ArticleState) -> dict:
+    """同步出图 API 丢线程池并发 —— 课程里也是这么干的（run_in_executor）。
+
+    一张失败不影响其它张：成功的进 `image_urls`，失败的进 `image_errors`。
+    """
+    t0 = time.perf_counter()
+    points = list(state.get("visual_points") or [])
+    service = build_image_service()
+
+    if not points:
+        return {
+            "image_urls": [],
+            "status": "images_skipped",
+            **_finish("generate_images", t0, "没有图点，跳过出图"),
+        }
+
+    with ThreadPoolExecutor(max_workers=min(4, len(points))) as pool:
+        results = list(pool.map(lambda p: service.generate(p[1], index=p[0]),
+                                list(enumerate(points, start=1))))
+
+    urls = [r.url for r in results if r.ok and r.url]
+    errors = [f"[{r.prompt[:12]}] {r.error}" for r in results if not r.ok]
+
+    note = f"{service.name} 出图 {len(urls)}/{len(points)} 张"
+    if errors:
+        note += f"，失败 {len(errors)} 张（见 image_errors）"
+    return {
+        "image_urls": urls,
+        "image_errors": errors,
+        "status": "done" if urls else "images_failed",
+        **_finish("generate_images", t0, note),
+    }

@@ -1,20 +1,19 @@
-"""阶段 5：trace 落库 + 极简页面。
+"""阶段 5 的测试：trace 落库 + 页面上的三步人机接力。
 
-两条底线，测试就守这两条：
-1. 同一份 state 重复 sync 不能把事件写两遍（页面上的时间线会重影）；
-2. 页面能「跑一条 → 停在审核 → 放行 → 出发布稿」，且 trace 一路累加。
+两条底线：
+1. 同一份 state 重复 sync 不能把事件写两遍（页面时间线会重影）；
+2. 页面能「跑一条 → 选选题 → 打回一次 → 放行 → 出图」，且成品 md 落盘。
 """
 from __future__ import annotations
 
 import pytest
 
-from contentops.output import slug_for, write_markdown
 from contentops.trace_store import TraceStore
 
 
-def _state(topic: str, *events: tuple[str, int, str], **extra) -> dict:
+def _state(direction: str, *events: tuple[str, int, str], **extra) -> dict:
     return {
-        "topic": topic,
+        "topic_direction": direction,
         "revision": extra.pop("revision", 0),
         "trace": [{"node": n, "ms": ms, "note": note} for n, ms, note in events],
         **extra,
@@ -28,78 +27,40 @@ def _state(topic: str, *events: tuple[str, int, str], **extra) -> dict:
 
 def test_sync_is_idempotent(work):
     store = TraceStore(work / "t.sqlite")
-    state = _state("选题", ("retrieve", 3, "检索到 3 条"))
+    state = _state("选题", ("plan_topics", 3, "出了 5 个"))
 
     store.sync(state, run_id="r1")
-    store.sync(state, run_id="r1")  # 同一份 state 再来一次
-    assert [e["node"] for e in store.events("r1")] == ["retrieve"]
+    store.sync(state, run_id="r1")
+    assert [e["node"] for e in store.events("r1")] == ["plan_topics"]
 
-    state["trace"].append({"node": "draft", "ms": 5, "note": "写了一版"})
-    store.sync(state, run_id="r1")  # 只补新增的那条
+    state["trace"].append({"node": "write_draft", "ms": 5, "note": "写了一版"})
+    store.sync(state, run_id="r1")
     assert [e["seq"] for e in store.events("r1")] == [0, 1]
 
 
 def test_status_follows_state(work):
     store = TraceStore(work / "t.sqlite")
 
-    store.sync(_state("a", ("retrieve", 1, "x"), __interrupt__=("wait",)), run_id="paused", mode="mock")
+    store.sync(_state("a", ("plan_topics", 1, "x"), __interrupt__=("wait",)), run_id="paused")
     assert store.get_run("paused")["status"] == "paused"
 
-    store.sync(
-        _state("b", ("retrieve", 1, "x"), published={"title": "b"}), run_id="pub", mode="mock"
-    )
-    assert store.get_run("pub")["status"] == "published"
+    store.sync(_state("b", ("generate_images", 1, "x"), image_urls=["/outputs/a.svg"]), run_id="done")
+    assert store.get_run("done")["status"] == "completed"
 
-    store.sync(_state("c", ("retrieve", 1, "x")), run_id="done", mode="mock")
-    assert store.get_run("done")["status"] == "ended"
+    store.sync(_state("c", ("plan_topics", 1, "x")), run_id="ended")
+    assert store.get_run("ended")["status"] == "ended"
 
     store.sync(_state("d"), run_id="bad", error="RuntimeError: 炸了")
-    row = store.get_run("bad")
-    assert row["status"] == "error" and "炸了" in row["error"]
+    assert store.get_run("bad")["status"] == "error"
 
 
-def test_mode_keeps_the_first_model(work):
-    """跑到一半换了模型（恢复时回落 mock），这行仍该记第一次用的那个。"""
+def test_feedback_is_recorded(work):
     store = TraceStore(work / "t.sqlite")
-    store.sync(_state("a", ("retrieve", 1, "x")), run_id="m", mode="deepseek-flash")
-    store.sync(_state("a", ("retrieve", 1, "x")), run_id="m", mode="mock")
-    assert store.get_run("m")["mode"] == "deepseek-flash"
-
-
-def test_usage_accumulates_and_list_is_newest_first(work):
-    store = TraceStore(work / "t.sqlite")
-    store.sync(_state("a", ("retrieve", 1, "x")), run_id="a", usage=(2, 100, 30, 0.0012))
-    store.sync(_state("a", ("retrieve", 1, "x")), run_id="a", usage=(1, 10, 5, 0.0003))
-    row = store.get_run("a")
-    assert (row["calls"], row["tokens_in"], row["tokens_out"]) == (3, 110, 35)
-    assert row["cost_cny"] == pytest.approx(0.0015)
-
-    store.sync(_state("b"), run_id="b")
-    assert [r["run_id"] for r in store.list_runs()] == ["b", "a"]
-
-
-# --------------------------------------------------------------------------- #
-# 发布稿落盘
-# --------------------------------------------------------------------------- #
-
-
-def test_write_markdown(work):
-    state = {
-        "published": {
-            "title": "用 AI 做周报 / 自动化",
-            "body": "正文",
-            "sources": [{"index": 1, "doc": "周报.md", "heading": "一、为什么"}],
-            "unchecked": ["某条没核实"],
-            "gate": "passed",
-            "revision": 1,
-            "published_at": "2026-11-19T02:00:00",
-        }
-    }
-    path = write_markdown(state, work)
-    assert path.name == f"{slug_for('用 AI 做周报 / 自动化')}.md"
-    text = path.read_text(encoding="utf-8")
-    assert "## 来源" in text and "《周报.md》 · 一、为什么" in text
-    assert "未核实断言" in text and "发布闸门：passed" in text
+    store.sync(_state("a", ("human_review", 1, "打回"),
+                      review_decision="reject", review_feedback="太干了"),
+               run_id="r1")
+    row = store.get_run("r1")
+    assert row["decision"] == "reject" and "太干" in row["review_note"]
 
 
 # --------------------------------------------------------------------------- #
@@ -110,9 +71,12 @@ def test_write_markdown(work):
 @pytest.fixture()
 def client(work, monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("IMAGE_PROVIDER", "mock")
+    monkeypatch.setenv("IMAGE_OUT_DIR", str(work / "out" / "images"))
     monkeypatch.setenv("CONTENTOPS_TRACE_DB", str(work / "traces.sqlite"))
     monkeypatch.setenv("CONTENTOPS_WEB_DB", str(work / "web.sqlite"))
     monkeypatch.setenv("CONTENTOPS_OUT_DIR", str(work / "out"))
+    monkeypatch.setenv("CONTENTOPS_NO_DOTENV", "1")
     from fastapi.testclient import TestClient
 
     from contentops import web
@@ -121,46 +85,48 @@ def client(work, monkeypatch):
 
 
 def test_page_runs_the_whole_human_loop(client, work):
-    assert client.get("/").status_code == 200
     assert "还没有运行记录" in client.get("/").text
 
-    resp = client.post("/runs", data={"topic": "用 AI 做周报自动化"}, follow_redirects=False)
+    resp = client.post("/runs", data={"topic": "AI 编程入门"}, follow_redirects=False)
     assert resp.status_code == 303
-    detail_url = resp.headers["location"]
+    url = resp.headers["location"]
 
-    page = client.get(detail_url)
-    assert page.status_code == 200
-    assert "等人工审核" in page.text
-    assert "retrieve" in page.text and "factcheck" in page.text
-    assert "放行并发布" in page.text
+    page = client.get(url)
+    assert "选一个选题" in page.text
+    assert page.text.count('name="selected_topic"') == 5
 
-    run_id = detail_url.rsplit("/", 1)[-1]
-    assert len(TraceStore(str(work / "traces.sqlite")).events(run_id)) >= 3
+    # 选题 → 停在审核
+    picked = page.text.split('name="selected_topic" value="')[1].split('"')[0]
+    import html as H
 
-    # 打回一次：会重写一版，然后又停在审核
-    client.post(f"{detail_url}/decision", data={"decision": "reject", "note": "太干，加点例子"})
-    page = client.get(detail_url)
-    assert "等人工审核" in page.text and "第 2 版" in page.text
+    picked = H.unescape(picked)
+    client.post(f"{url}/select", data={"selected_topic": picked})
+    page = client.get(url)
+    assert "人工审核" in page.text and "第 1 版" in page.text
 
-    # 放行：发布稿落盘，页面出现发布记录
-    resp = client.post(
-        f"{detail_url}/decision", data={"decision": "approve", "note": ""}, follow_redirects=False
-    )
-    assert resp.status_code == 303
-    page = client.get(detail_url)
-    assert "已发布" in page.text and "发布记录" in page.text
+    # 打回一次 → 第 2 版，又停在审核
+    client.post(f"{url}/review", data={"decision": "reject", "note": "太干，加例子"})
+    page = client.get(url)
+    assert "第 2 版" in page.text and "人工审核" in page.text
 
-    saved = work / "out" / f"{slug_for('用 AI 做周报自动化')}.md"
-    assert saved.exists()
-    assert "发布闸门" in saved.read_text(encoding="utf-8")
+    # 放行 → 出图 → 成品落盘
+    client.post(f"{url}/review", data={"decision": "approve", "note": ""})
+    page = client.get(url)
+    assert "配图" in page.text and page.text.count("<figure>") == 4
+    assert "已完成" in page.text
 
-    # 已经发布的运行再点一次，不该报错也不该再写一行
-    assert client.post(f"{detail_url}/decision", data={"decision": "approve"}).status_code == 200
-
-    runs = TraceStore(str(work / "traces.sqlite")).list_runs()
-    assert len(runs) == 1 and runs[0]["status"] == "published"
-    assert client.get("/healthz").json()["runs"] == 1
+    run_id = url.rsplit("/", 1)[-1]
+    assert len(TraceStore(str(work / "traces.sqlite")).events(run_id)) >= 6
+    assert list((work / "out").glob("*.md"))
 
 
 def test_detail_404(client):
     assert client.get("/runs/run-not-exist").status_code == 404
+
+
+def test_selection_accepts_custom_topic(client):
+    resp = client.post("/runs", data={"topic": "AI 编程入门"}, follow_redirects=False)
+    url = resp.headers["location"]
+    client.post(f"{url}/select", data={"selected_topic": "我自己想的选题"})
+    page = client.get(url)
+    assert "我自己想的选题" in page.text

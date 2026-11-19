@@ -1,17 +1,14 @@
-"""图的组装。
+"""图的组装 —— 项目二（自媒体运营 AI 智能体）版。
 
-六节点流水线（阶段 2）：
+    START → plan_topics → human_select ──(中断 #1：人选)──→ write_draft
+          → human_review ──(中断 #2：人审)──┬─ approve → extract_visuals → generate_images → END
+                                            └─ reject  → write_draft（带意见重写，最多 MAX_REVISION 版）
 
-    START → retrieve → draft → factcheck ─┬─(有未核实且还有重写额度)→ draft
-                                          └─(通过 / 没资料可写 / 用尽额度)→ review
-    review ─┬─(放行)→ publish → END
-            ├─(打回且还有额度)→ draft
-            └─(打回且额度用尽)→ END（宁可空手回去，也不硬发）
+两个条件边是这份项目的「人在环里」得分点：
+- `human_select` 停住等选题 —— 不是先跑完再让你改；
+- `human_review` 停住等放行，打回就带着意见重写，改到满意为止（或额度用尽收工）。
 
-两个条件边是本项目的「编排」得分点：
-- 回写环（factcheck → draft）证明的是**能用证据否定自己**；
-- `review` 用 `interrupt()` 真的把进程停住，不是等一个 sleep —— 人第二天回来
-  还能接着跑，因为 checkpointer 把状态存下来了。
+`interrupt()` 必须配 checkpointer + `thread_id`，少任何一个都恢复不了。
 """
 from __future__ import annotations
 
@@ -24,61 +21,55 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
-from .checkpoint import sqlite_saver
-from .nodes import draft_node, factcheck_node, publish_node, retrieve_node, review_node
-from .state import ContentState
+from .checkpoint import postgres_saver, sqlite_saver
+from .nodes import (
+    extract_visuals_node,
+    generate_images_node,
+    human_review_node,
+    human_select_node,
+    plan_topics_node,
+    write_draft_node,
+)
+from .state import ArticleState, INITIAL_STATE
 
-#: 一稿最多写几版。核查不过 / 人工打回都吃这个额度，用尽就交人或者收工。
+#: 正文最多写几版。每次打回 +1，用尽就收工（不硬发）。
 MAX_REVISION = 3
 
 
-def route_after_factcheck(state: ContentState) -> str:
-    """核查之后去哪。"""
-    if not state.get("unchecked"):
-        return "review"
-    if not state.get("hits"):
-        # 手上没有资料，再写一版也补不出引用 —— 直接把问题推给人，别空转
-        return "review"
-    if state.get("revision", 0) >= MAX_REVISION:
-        return "review"
-    return "draft"
-
-
-def route_after_review(state: ContentState) -> str:
-    """人工答复之后去哪。"""
+def route_after_review(state: ArticleState) -> str:
+    """审核之后去哪。"""
     if state.get("review_decision") == "approve":
-        return "publish"
-    if not state.get("hits"):
-        # 没有资料可引，再写一版也只能编 —— 直接收工，别把额度耗在注定做不成的事上
+        return "to_images"
+    if int(state.get("revision") or 0) >= MAX_REVISION:
         return "end"
-    if state.get("revision", 0) >= MAX_REVISION:
-        return "end"
-    return "draft"
+    return "to_draft"
 
 
 def build_graph(checkpointer: Any = None) -> Any:
-    g = StateGraph(ContentState)
-    g.add_node("retrieve", retrieve_node)
-    g.add_node("draft", draft_node)
-    g.add_node("factcheck", factcheck_node)
-    g.add_node("review", review_node)
-    g.add_node("publish", publish_node)
+    g = StateGraph(ArticleState)
+    g.add_node("plan_topics", plan_topics_node)
+    g.add_node("human_select", human_select_node)
+    g.add_node("write_draft", write_draft_node)
+    g.add_node("human_review", human_review_node)
+    g.add_node("extract_visuals", extract_visuals_node)
+    g.add_node("generate_images", generate_images_node)
 
-    g.add_edge(START, "retrieve")
-    g.add_edge("retrieve", "draft")
-    g.add_edge("draft", "factcheck")
+    g.add_edge(START, "plan_topics")
+    g.add_edge("plan_topics", "human_select")
+    g.add_edge("human_select", "write_draft")
+    g.add_edge("write_draft", "human_review")
     g.add_conditional_edges(
-        "factcheck", route_after_factcheck, {"draft": "draft", "review": "review"}
+        "human_review",
+        route_after_review,
+        {"to_images": "extract_visuals", "to_draft": "write_draft", "end": END},
     )
-    g.add_conditional_edges(
-        "review", route_after_review, {"draft": "draft", "publish": "publish", "end": END}
-    )
-    g.add_edge("publish", END)
+    g.add_edge("extract_visuals", "generate_images")
+    g.add_edge("generate_images", END)
     return g.compile(checkpointer=checkpointer)
 
 
 # --------------------------------------------------------------------------- #
-# 会话工具：interrupt 必须配 checkpointer + thread_id，少了任何一个都恢复不了
+# 会话工具
 # --------------------------------------------------------------------------- #
 
 
@@ -86,12 +77,12 @@ def config_for(thread_id: str) -> dict[str, Any]:
     return {"configurable": {"thread_id": thread_id}}
 
 
-def is_interrupted(state: ContentState) -> bool:
-    return bool(state.get("__interrupt__"))
+def is_interrupted(state: Any) -> bool:
+    return bool(state.get("__interrupt__")) if isinstance(state, dict) else bool(state)
 
 
-def interrupt_payload(state: ContentState) -> Any:
-    """取出 `interrupt()` 推出来的审核包。"""
+def interrupt_payload(state: ArticleState) -> Any:
+    """取出 `interrupt()` 推出来的包（选题包或审核包）。"""
     interrupts = state.get("__interrupt__") or ()
     return interrupts[0].value if interrupts else None
 
@@ -107,47 +98,33 @@ def new_session() -> tuple[Any, str]:
 
 
 @contextmanager
-def session(thread_id: str | None = None, *, db: str | None = None) -> Iterator[tuple[Any, str]]:
-    """开一次会话。
-
-    `db` 为空 → 内存 saver（进程内可恢复，进程退出就没）。
-    `db` 给了 → SQLite saver，状态落盘，换一个进程也能接着跑。
-    """
+def session(
+    thread_id: str | None = None, *, db: str | None = None, pg: str | None = None
+) -> Iterator[tuple[Any, str]]:
+    """开一次会话。后端三选一，优先级 `pg > db > 内存`。"""
     tid = thread_id or new_thread_id()
-    if db:
+    if pg:
+        with postgres_saver(pg) as saver:
+            yield build_graph(saver), tid
+    elif db:
         with sqlite_saver(db) as saver:
             yield build_graph(saver), tid
     else:
         yield build_graph(InMemorySaver()), tid
 
 
-def start(app: Any, topic: str, thread_id: str) -> ContentState:
-    return app.invoke({"topic": topic, "revision": 0}, config_for(thread_id))
+def initial_input(topic_direction: str, *, platform: str = "xiaohongshu") -> dict[str, Any]:
+    return {
+        **INITIAL_STATE,
+        "topic_direction": topic_direction,
+        "platform": platform,
+        "status": "started",
+    }
 
 
-def resume(app: Any, answer: Any, thread_id: str) -> ContentState:
+def start(app: Any, topic_direction: str, thread_id: str, *, platform: str = "xiaohongshu") -> ArticleState:
+    return app.invoke(initial_input(topic_direction, platform=platform), config_for(thread_id))
+
+
+def resume(app: Any, answer: Any, thread_id: str) -> ArticleState:
     return app.invoke(Command(resume=answer), config_for(thread_id))
-
-
-def run(
-    topic: str,
-    *,
-    decision: str | None = None,
-    thread_id: str | None = None,
-    max_rounds: int = 6,
-) -> ContentState:
-    """跑一条链路。
-
-    `decision=None`（默认）→ 停在人工审核处，返回带 `__interrupt__` 的 state，
-    这是「人在环里」的真实形态，测试和 CLI 都靠它。
-    `decision="approve"/"reject"` → 自动代为答复，一路跑到 END（或额度用尽）。
-    """
-    app, default_tid = new_session()
-    tid = thread_id or default_tid
-
-    state = start(app, topic, tid)
-    rounds = 0
-    while decision is not None and is_interrupted(state) and rounds < max_rounds:
-        state = resume(app, {"decision": decision, "note": "auto"}, tid)
-        rounds += 1
-    return state

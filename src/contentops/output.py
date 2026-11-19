@@ -1,46 +1,64 @@
-"""发布记录的落盘（markdown）。
+"""成品落盘（markdown）—— 项目二版。
 
-放在单独模块里，是因为它有两个调用方：命令行 `run --out` 和 Web 页面的「放行」。
-节点本身不写盘 —— `publish_node` 只组装字段，谁决定落盘谁负责写，
-这样单元测试里跑一条链路不会顺手在仓库里撒文件。
+一篇稿子 = 标题 + 正文 + 图点 + 配图。命令行 `--out` 和页面「出图完成」都调这里，
+节点自己不写盘（单元测试跑链路时不该在仓库里撒文件）。
 """
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 
-from .state import ContentState
+from .state import ArticleState
 
 #: 文件名里允许中文，其余字符一律压成连字符
 _SLUG_BAD = re.compile(r"[^\w\u4e00-\u9fff]+")
 
 
 def slug_for(title: str) -> str:
-    """选题 → 文件名。页面要用它拼发布稿的链接，所以单独暴露出来。"""
+    """选题 → 文件名。页面要用它拼成品链接，所以单独暴露出来。"""
     return _SLUG_BAD.sub("-", title).strip("-")[:40] or "untitled"
 
 
-def write_markdown(state: ContentState, out_dir: str | Path) -> Path:
-    published = state.get("published") or {}
-    title = str(published.get("title") or "untitled")
-    slug = slug_for(title)
+def write_markdown(state: ArticleState, out_dir: str | Path) -> Path:
+    """把一条跑完的运行写成 markdown。
 
-    lines = [f"# {title}", "", published.get("body", ""), "", "## 来源"]
-    for s in published.get("sources", []):
-        where = f"《{s['doc']}》" + (f" · {s['heading']}" if s["heading"] else "")
-        lines.append(f"- [{s['index']}] {where}")
-    if published.get("unchecked"):
-        lines += ["", "## 未核实断言（发布时人工已知情）"]
-        lines += [f"- {u}" for u in published["unchecked"]]
+    图点在前、配图在后：小红书是先定「每张图讲什么」再出图的，
+    顺序反过来读者会以为图是随手配的。
+    """
+    title = str(state.get("selected_topic") or state.get("topic_direction") or "untitled")
+    body = str(state.get("article_content") or "")
+    points = list(state.get("visual_points") or [])
+    urls = list(state.get("image_urls") or [])
+    errors = list(state.get("image_errors") or [])
+
+    lines = [f"# {title}", "", body, ""]
+
+    if points:
+        lines += ["## 配图脚本（图点）", ""]
+        lines += [f"{i}. {p}" for i, p in enumerate(points, start=1)]
+        lines.append("")
+
+    if urls:
+        lines += ["## 配图", ""]
+        for i, u in enumerate(urls, start=1):
+            shown = u if u.startswith("http") else f"（本地）{u}"
+            lines.append(f"![图 {i}]({shown})")
+        lines.append("")
+
+    if errors:
+        lines += ["## 出图失败（没有藏）", ""]
+        lines += [f"- {e}" for e in errors]
+        lines.append("")
+
     lines += [
-        "",
         "---",
-        f"发布闸门：{published.get('gate')}　版本：第 {published.get('revision')} 版　"
-        f"时间：{published.get('published_at')}",
+        f"版本：第 {state.get('revision')} 版　图点 {len(points)} 个　"
+        f"出图 {len(urls)}/{len(points)}　导出时间：{datetime.now().isoformat(timespec='seconds')}",
     ]
 
     directory = Path(out_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{slug}.md"
+    path = directory / f"{slug_for(title)}.md"
     path.write_text("\n".join(lines), encoding="utf-8")
     return path

@@ -30,6 +30,8 @@ outputs/
 *.log
 # checkpoint 落盘（--db .contentops/...）
 .contentops/
+# 演示用的临时库 / 出图（serve 对着 .demo 跑）
+.demo/
 
 # 本地探测脚本（不进仓库）
 .probe/
